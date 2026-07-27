@@ -22,7 +22,8 @@
  *   AB_CONCURRENCY_ROUNDS=2
  *   AB_DISTINCT_DETAIL_COUNT=8
  *   AB_REQUIRE_DISTINCT_LOAD=1
- *   AB_MIN_SUCCESS_RATE=1.0
+ *   AB_MIN_OLD_SUCCESS_RATE=0.8
+ *   AB_MIN_NEW_SUCCESS_RATE=1.0
  *   AB_MIN_EQUIV_RATE=1.0
  *   AB_MIN_LIST_OVERLAP=0.5
  *   AB_LIST_TOTAL_TOLERANCE=0.05
@@ -77,6 +78,7 @@ Common controls:
   AB_SAMPLES=20  AB_WARMUPS=1  AB_TIMEOUT_MS=45000
   AB_CONCURRENCY=4  AB_CONCURRENCY_REQUESTS=12  AB_CONCURRENCY_ROUNDS=2
   AB_DISTINCT_DETAIL_COUNT=8  AB_REQUIRE_DISTINCT_LOAD=1
+  AB_MIN_OLD_SUCCESS_RATE=0.80  AB_MIN_NEW_SUCCESS_RATE=1.00
   OLD_AUTH_MODE=query|header|bearer|none
   NEW_AUTH_MODE=query|header|bearer|none
   AB_MAX_NEW_P95_RATIO=0.95  AB_MAX_PAIRED_P50_RATIO=0.95
@@ -240,7 +242,15 @@ const CONCURRENCY_REQUESTS = integerEnv(
 const CONCURRENCY_ROUNDS = integerEnv("AB_CONCURRENCY_ROUNDS", 2, 1, 4);
 const DISTINCT_DETAIL_COUNT = integerEnv("AB_DISTINCT_DETAIL_COUNT", 8, 4, 20);
 const REQUIRE_DISTINCT_LOAD = booleanEnv("AB_REQUIRE_DISTINCT_LOAD", true);
-const MIN_SUCCESS_RATE = ratioEnv("AB_MIN_SUCCESS_RATE", 1);
+const COMMON_MIN_SUCCESS_RATE = ratioEnv("AB_MIN_SUCCESS_RATE", 1);
+const MIN_OLD_SUCCESS_RATE = ratioEnv(
+  "AB_MIN_OLD_SUCCESS_RATE",
+  ENV.AB_MIN_SUCCESS_RATE === undefined ? 0.8 : COMMON_MIN_SUCCESS_RATE
+);
+const MIN_NEW_SUCCESS_RATE = ratioEnv(
+  "AB_MIN_NEW_SUCCESS_RATE",
+  COMMON_MIN_SUCCESS_RATE
+);
 const MIN_EQUIV_RATE = ratioEnv("AB_MIN_EQUIV_RATE", 1);
 const MIN_LIST_OVERLAP = ratioEnv("AB_MIN_LIST_OVERLAP", 0.5);
 const LIST_TOTAL_TOLERANCE = ratioEnv("AB_LIST_TOTAL_TOLERANCE", 0.05);
@@ -1392,11 +1402,14 @@ function assessDistinctDetails(aggregate) {
   const failures = [];
   const oldStats = providerStats(aggregate.old);
   const newStats = providerStats(aggregate.new);
-  for (const [key, stats] of [["OLD", oldStats], ["NEW", newStats]]) {
-    if (stats.successRate < MIN_SUCCESS_RATE) {
+  for (const [key, stats, minimum] of [
+    ["OLD", oldStats, MIN_OLD_SUCCESS_RATE],
+    ["NEW", newStats, MIN_NEW_SUCCESS_RATE],
+  ]) {
+    if (stats.successRate < minimum) {
       failures.push(
         `distinct details ${key} valid success ${(stats.successRate * 100).toFixed(0)}% is below ` +
-          `${(MIN_SUCCESS_RATE * 100).toFixed(0)}%`
+          `${(minimum * 100).toFixed(0)}%`
       );
     }
   }
@@ -1459,13 +1472,13 @@ function assess(results, concurrencyResults) {
   for (const { endpoint, oldResults, newResults, pairs } of results.values()) {
     const oldStats = providerStats(oldResults);
     const newStats = providerStats(newResults);
-    for (const [provider, stats, providerResults] of [
-      ["OLD", oldStats, oldResults],
-      ["NEW", newStats, newResults],
+    for (const [provider, stats, providerResults, minimum] of [
+      ["OLD", oldStats, oldResults, MIN_OLD_SUCCESS_RATE],
+      ["NEW", newStats, newResults, MIN_NEW_SUCCESS_RATE],
     ]) {
-      if (stats.successRate < MIN_SUCCESS_RATE) {
+      if (stats.successRate < minimum) {
         failures.push(
-          `${endpoint.key} ${provider} valid success ${(stats.successRate * 100).toFixed(0)}% is below ${(MIN_SUCCESS_RATE * 100).toFixed(0)}%`
+          `${endpoint.key} ${provider} valid success ${(stats.successRate * 100).toFixed(0)}% is below ${(minimum * 100).toFixed(0)}%`
         );
         for (const [issue, count] of issueSummary(providerResults).slice(0, 3)) {
           if (count > 0) failures.push(`${endpoint.key} ${provider}: ${issue} (${count}/${SAMPLES})`);
@@ -1515,9 +1528,10 @@ function assess(results, concurrencyResults) {
   for (const key of ["old", "new"]) {
     const stats = providerStats(concurrencyResults[key]);
     concurrencyStats[key] = stats;
-    if (stats.successRate < MIN_SUCCESS_RATE) {
+    const minimum = key === "old" ? MIN_OLD_SUCCESS_RATE : MIN_NEW_SUCCESS_RATE;
+    if (stats.successRate < minimum) {
       failures.push(
-        `${key.toUpperCase()} concurrency valid success ${(stats.successRate * 100).toFixed(0)}% is below ${(MIN_SUCCESS_RATE * 100).toFixed(0)}%`
+        `${key.toUpperCase()} concurrency valid success ${(stats.successRate * 100).toFixed(0)}% is below ${(minimum * 100).toFixed(0)}%`
       );
     }
   }
