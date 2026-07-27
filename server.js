@@ -24,6 +24,7 @@ import {
 import { enqueueJob, jobQueueStats, recommendedHardware } from "./jobQueue.js";
 import { cacheKey, cached, cachedSwr, cacheStats } from "./cache.js";
 import { warmBrowserPool, browserPoolStats } from "./browser.js";
+import { assertAuthLooksValid } from "./auth.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const PUBLIC_DIR = join(__dirname, "public");
@@ -44,6 +45,14 @@ const ITEM_CACHE_TTL = Math.max(
   Number(process.env.ITEM_CACHE_TTL_MS) || 30 * 60 * 1000
 );
 const SEARCH_CACHE_TTL = Math.max(5_000, Number(process.env.SEARCH_CACHE_TTL_MS) || 60_000);
+const LIST_CACHE_TTL = Math.max(
+  30_000,
+  Number(process.env.LIST_CACHE_TTL_MS) || 10 * 60 * 1000
+);
+const META_CACHE_TTL = Math.max(
+  60_000,
+  Number(process.env.META_CACHE_TTL_MS) || 6 * 60 * 60 * 1000
+);
 
 function sendJson(res, status, body) {
   const payload = JSON.stringify(body, null, 2);
@@ -239,8 +248,15 @@ async function handleItemReview(req, res) {
     sendTmapi(res, tmapiError(422, "item_id is required"));
     return;
   }
-  await withJob(res, `item_review:${itemId}`, () =>
-    getItemReviews(itemId, { page, page_size, language })
+  await withJob(
+    res,
+    `item_review:${itemId}`,
+    () => getItemReviews(itemId, { page, page_size, language }),
+    {
+      cacheTtl: LIST_CACHE_TTL,
+      cacheParts: ["item_review", itemId, page, page_size, language],
+      swr: true,
+    }
   );
 }
 
@@ -256,8 +272,15 @@ async function handleItemFreight(req, res) {
     sendTmapi(res, tmapiError(422, "item_id is required"));
     return;
   }
-  await withJob(res, `item_freight:${itemId}`, () =>
-    getItemFreight(itemId, { language })
+  await withJob(
+    res,
+    `item_freight:${itemId}`,
+    () => getItemFreight(itemId, { language }),
+    {
+      cacheTtl: LIST_CACHE_TTL,
+      cacheParts: ["item_freight", itemId, language],
+      swr: true,
+    }
   );
 }
 
@@ -320,8 +343,15 @@ async function handleSearchImage(req, res) {
     return;
   }
 
-  await withJob(res, `search_img`, () =>
-    searchByImage({ img_url, page, page_size, language, sort })
+  await withJob(
+    res,
+    "search_img",
+    () => searchByImage({ img_url, page, page_size, language, sort }),
+    {
+      cacheTtl: LIST_CACHE_TTL,
+      cacheParts: ["search_image", img_url, page, page_size, language, sort],
+      swr: true,
+    }
   );
 }
 
@@ -339,7 +369,19 @@ async function handleSearchFactory(req, res) {
       page_size: Number(url.searchParams.get("page_size") || 20),
       sort: url.searchParams.get("sort") || "default",
       language: normalizeLanguage(url.searchParams.get("language") || "en"),
-    })
+    }),
+    {
+      cacheTtl: LIST_CACHE_TTL,
+      cacheParts: [
+        "search_factory",
+        url.searchParams.get("keywords") || url.searchParams.get("keyword"),
+        url.searchParams.get("page"),
+        url.searchParams.get("page_size"),
+        url.searchParams.get("sort"),
+        url.searchParams.get("language"),
+      ],
+      swr: true,
+    }
   );
 }
 
@@ -359,7 +401,22 @@ async function handleShopItems(req, res) {
       keyword: url.searchParams.get("keyword") || "",
       shop_cat_id: url.searchParams.get("shop_cat_id") || url.searchParams.get("cat") || "",
       language: normalizeLanguage(url.searchParams.get("language") || "en"),
-    })
+    }),
+    {
+      cacheTtl: LIST_CACHE_TTL,
+      cacheParts: [
+        "shop_items",
+        url.searchParams.get("shop_url"),
+        url.searchParams.get("member_id"),
+        url.searchParams.get("page"),
+        url.searchParams.get("page_size"),
+        url.searchParams.get("sort"),
+        url.searchParams.get("keyword"),
+        url.searchParams.get("shop_cat_id") || url.searchParams.get("cat"),
+        url.searchParams.get("language"),
+      ],
+      swr: true,
+    }
   );
 }
 
@@ -374,7 +431,17 @@ async function handleShopInfo(req, res) {
       shop_url: url.searchParams.get("shop_url") || "",
       member_id: url.searchParams.get("member_id") || "",
       language: normalizeLanguage(url.searchParams.get("language") || "en"),
-    })
+    }),
+    {
+      cacheTtl: META_CACHE_TTL,
+      cacheParts: [
+        "shop_info",
+        url.searchParams.get("shop_url"),
+        url.searchParams.get("member_id"),
+        url.searchParams.get("language"),
+      ],
+      swr: true,
+    }
   );
 }
 
@@ -389,7 +456,17 @@ async function handleShopCats(req, res) {
       shop_url: url.searchParams.get("shop_url") || "",
       member_id: url.searchParams.get("member_id") || "",
       language: normalizeLanguage(url.searchParams.get("language") || "en"),
-    })
+    }),
+    {
+      cacheTtl: META_CACHE_TTL,
+      cacheParts: [
+        "shop_categories",
+        url.searchParams.get("shop_url"),
+        url.searchParams.get("member_id"),
+        url.searchParams.get("language"),
+      ],
+      swr: true,
+    }
   );
 }
 
@@ -403,7 +480,16 @@ async function handleCategoryInfo(req, res) {
     getCategoryInfo({
       cat_id: url.searchParams.get("cat_id") || "",
       language: normalizeLanguage(url.searchParams.get("language") || "en"),
-    })
+    }),
+    {
+      cacheTtl: META_CACHE_TTL,
+      cacheParts: [
+        "category_info",
+        url.searchParams.get("cat_id"),
+        url.searchParams.get("language"),
+      ],
+      swr: true,
+    }
   );
 }
 
@@ -421,7 +507,20 @@ async function handleCategoryProducts(req, res) {
       page_size: Number(url.searchParams.get("page_size") || 20),
       sort: url.searchParams.get("sort") || "default",
       language: normalizeLanguage(url.searchParams.get("language") || "en"),
-    })
+    }),
+    {
+      cacheTtl: LIST_CACHE_TTL,
+      cacheParts: [
+        "category_products",
+        url.searchParams.get("cat_id"),
+        url.searchParams.get("keyword"),
+        url.searchParams.get("page"),
+        url.searchParams.get("page_size"),
+        url.searchParams.get("sort"),
+        url.searchParams.get("language"),
+      ],
+      swr: true,
+    }
   );
 }
 
@@ -638,8 +737,10 @@ const ROUTES = [
 ];
 
 async function handleHealth(_req, res) {
+  const auth = await assertAuthLooksValid();
   sendJson(res, 200, {
     ok: true,
+    auth,
     uptimeSec: Math.round(process.uptime()),
     queue: jobQueueStats(),
     browsers: browserPoolStats(),

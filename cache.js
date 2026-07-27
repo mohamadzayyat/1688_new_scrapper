@@ -17,6 +17,7 @@ const DISK_DIR =
   process.env.CACHE_DIR ||
   join(fileURLToPath(new URL(".", import.meta.url)), ".cache");
 const DISK_ENABLED = String(process.env.DISK_CACHE || "1") !== "0";
+const CACHE_VERSION = process.env.CACHE_VERSION || "v2";
 
 const store = new Map(); // key -> { expires, staleUntil, value }
 const inflight = new Map(); // key -> Promise (singleflight)
@@ -44,7 +45,19 @@ function diskPath(key) {
 }
 
 export function cacheKey(parts) {
-  return parts.map((p) => String(p ?? "").trim().toLowerCase()).join("|");
+  return [CACHE_VERSION, ...parts]
+    .map((p) => String(p ?? "").trim().toLowerCase())
+    .join("|");
+}
+
+function isCacheableValue(value) {
+  if (!value || Number(value.code) !== 200 || value.data == null) return false;
+  if (!value.data || typeof value.data !== "object" || Array.isArray(value.data)) {
+    return true;
+  }
+  const collectionKeys = ["items", "list", "categories", "reviews", "ratings"];
+  const present = collectionKeys.filter((key) => Array.isArray(value.data[key]));
+  return present.length === 0 || present.some((key) => value.data[key].length > 0);
 }
 
 export function cacheGet(key) {
@@ -149,7 +162,7 @@ export async function cached(key, ttlMs, producer) {
     }
     misses += 1;
     const value = await producer();
-    if (value && value.code === 200) {
+    if (isCacheableValue(value)) {
       cacheSet(key, value, ttlMs);
     }
     return value;
@@ -174,7 +187,7 @@ export async function cachedSwr(key, ttlMs, producer) {
     if (!inflight.has(key)) {
       const refresh = (async () => {
         const value = await producer();
-        if (value && value.code === 200) cacheSet(key, value, ttlMs);
+        if (isCacheableValue(value)) cacheSet(key, value, ttlMs);
         return value;
       })().finally(() => inflight.delete(key));
       inflight.set(key, refresh);
@@ -188,7 +201,7 @@ export async function cachedSwr(key, ttlMs, producer) {
     if (!inflight.has(key)) {
       const refresh = (async () => {
         const value = await producer();
-        if (value && value.code === 200) cacheSet(key, value, ttlMs);
+        if (isCacheableValue(value)) cacheSet(key, value, ttlMs);
         return value;
       })().finally(() => inflight.delete(key));
       inflight.set(key, refresh);
@@ -200,7 +213,7 @@ export async function cachedSwr(key, ttlMs, producer) {
 
   const job = (async () => {
     const value = await producer();
-    if (value && value.code === 200) cacheSet(key, value, ttlMs);
+    if (isCacheableValue(value)) cacheSet(key, value, ttlMs);
     return value;
   })().finally(() => inflight.delete(key));
 

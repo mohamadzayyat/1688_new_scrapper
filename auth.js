@@ -133,16 +133,29 @@ export async function login1688({ timeoutMs = 10 * 60_000 } = {}) {
 }
 
 export async function newAuthedContext(browser, options = {}) {
+  const { blockAssets = true, ...contextOptions } = options;
   const base = {
     locale: "zh-CN",
     extraHTTPHeaders: { "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8" },
-    ...options,
+    ...contextOptions,
   };
 
-  if (await hasSavedAuth()) {
-    return browser.newContext({ ...base, storageState: AUTH_PATH });
+  const context = await hasSavedAuth()
+    ? await browser.newContext({ ...base, storageState: AUTH_PATH })
+    : await browser.newContext(base);
+
+  if (blockAssets) {
+    await context.route("**/*", (route) => {
+      const request = route.request();
+      if (["image", "media", "font"].includes(request.resourceType())) return route.abort();
+      if (/google-analytics|googletagmanager|doubleclick|hm\.baidu|arms-retcode/i.test(request.url())) {
+        return route.abort();
+      }
+      return route.continue();
+    });
   }
-  return browser.newContext(base);
+
+  return context;
 }
 
 export async function assertAuthLooksValid() {

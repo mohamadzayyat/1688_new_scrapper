@@ -39,5 +39,30 @@ console.log(
 );
 if (!converted) failed += 1;
 
-console.log(`\n${checks.length + 1 - failed}/${checks.length + 1} compatibility checks passed`);
+const topCategoriesResponse = await fetch(`${BASE}/1688/category/info`);
+const topCategoriesBody = await topCategoriesResponse.json();
+const topCategoriesOk =
+  Number(topCategoriesBody.code) === 200 &&
+  Array.isArray(topCategoriesBody.data) &&
+  topCategoriesBody.data.length >= 50;
+console.log(
+  `${topCategoriesOk ? "OK" : "FAIL"} top_categories count=${topCategoriesBody.data?.length ?? 0}`
+);
+if (!topCategoriesOk) failed += 1;
+
+const categoryInfoResponse = await fetch(
+  `${BASE}/1688/category/info?cat_id=130823000`
+);
+const categoryInfoBody = await categoryInfoResponse.json();
+const categoryInfoOk =
+  Number(categoryInfoBody.code) === 200 &&
+  Array.isArray(categoryInfoBody.data?.children) &&
+  categoryInfoBody.data.children.length === 4;
+console.log(
+  `${categoryInfoOk ? "OK" : "FAIL"} category_info children=${categoryInfoBody.data?.children?.length ?? 0}`
+);
+if (!categoryInfoOk) failed += 1;
+
+const total = checks.length + 3;
+console.log(`\n${total - failed}/${total} compatibility checks passed`);
 process.exit(failed === 0 ? 0 : 1);

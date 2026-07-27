@@ -17,6 +17,48 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function assertNotLoginPage(page, operation) {
+  if (/login\.(?:taobao|1688)\.com|member\/signin/i.test(page.url())) {
+    throw new Error(
+      `1688 login session expired while loading ${operation}; run npm run login`
+    );
+  }
+}
+
+const TOP_CATEGORIES = [
+  ["130823000", "Adult Products"], ["1", "Agriculture"], ["54", "Apparel Accessories & Jewelry"],
+  ["71", "Automobiles, Motorcycles & Accessories"], ["122916002", "Automotive Supplies"],
+  ["97", "Beauty Skincare/Makeup"], ["201346017", "Building Materials"], ["69", "Business Services"],
+  ["130822002", "Catering & Fresh Food"], ["8", "Chemicals"], ["311", "Children's Wear"],
+  ["509", "Communication Product"], ["201547801", "Daily Use Kitchenware & Drinkware"],
+  ["7", "Digital & Computer"], ["5", "Electrical & Electronic"], ["57", "Electronic Components"],
+  ["10", "Energy"], ["64", "Environmental Protection"], ["2", "Food & Beverage"],
+  ["59", "Hardware & Tools"], ["6", "Home Appliances"], ["13", "Home Improvement & Building Materials"],
+  ["96", "Home Textiles & Decor"], ["15", "Household Daily Necessities"], ["10208", "Instruments & Meters"],
+  ["123614001", "Iron & Steel"], ["58", "Lighting Fixtures"], ["1042954", "Luggage, Bags & Leather Goods"],
+  ["65", "Machinery & Industrial Equipment"], ["1426", "Machine Tool"], ["53", "Media & Broadcasting"],
+  ["10165", "Men's Wear"], ["9", "Minerals & Metallurgy"], ["202052814", "New Energy"],
+  ["67", "Office & Culture"], ["68", "Packaging"], ["130822220", "Personal Care/Home Cleaning"],
+  ["122916001", "Pets & Gardening"], ["66", "Pharmaceuticals & Healthcare"], ["72", "Printing"],
+  ["2805", "Processing"], ["55", "Rubber & Plastics"], ["70", "Safety & Protection"],
+  ["1038378", "Shoes"], ["18", "Sports & Outdoors"], ["201547901", "Storage & Cleaning Utensils"],
+  ["4", "Textiles & Leather Products"], ["1813", "Toys"], ["12", "Transportation"],
+  ["312", "Underwear"], ["2829", "Used Equipment Transfer"], ["10166", "Women's Clothing"],
+].map(([id, name]) => ({ id, name, name_en: name, level: 0, children: [] }));
+
+const KNOWN_CATEGORY_CHILDREN = {
+  "130823000": [
+    ["126144003", "Adult Toys & Novelties"],
+    ["123862005", "Family Planning Products"],
+    ["126178001", "Female Toys"],
+    ["126150002", "Male Toys"],
+  ],
+};
+
+function knownCategory(categoryId) {
+  return TOP_CATEGORIES.find((category) => category.id === String(categoryId || ""));
+}
+
 async function withLangCookies(context, lang) {
   await context.addCookies([
     {
@@ -41,6 +83,7 @@ async function openOfferPage(browser, itemId, lang = "zh") {
     waitUntil: "domcontentloaded",
     timeout: 60_000,
   });
+  assertNotLoginPage(page, "item detail");
   await page
     .waitForFunction(() => Boolean(window.context?.result?.data), null, {
       timeout: 45_000,
@@ -172,12 +215,17 @@ export async function getItemReviews(
       const start = (pageNo - 1) * size;
       const slice = reviews.slice(start, start + size);
 
+      if (!slice.length) {
+        return tmapiError(502, "No reviews were extracted from 1688");
+      }
+
       return tmapiOk({
         item_id: Number(id),
         page: pageNo,
         page_size: size,
         total_count: reviews.length,
         items: slice,
+        list: slice,
       });
     } finally {
       await context.close();
@@ -314,12 +362,12 @@ export async function getShopItems({
   shop_cat_id = "",
   language = "zh",
 } = {}) {
-  const mid = extractMemberId(shop_url, member_id);
+  let mid = extractMemberId(shop_url, member_id);
 
   const lang = normalizeLang(language);
   const pageNo = Math.max(1, Number(page) || 1);
   const size = Math.min(50, Math.max(1, Number(page_size) || 20));
-  const offerListUrl = shopOfferListUrl(shop_url, mid, pageNo);
+  let offerListUrl = shopOfferListUrl(shop_url, mid, pageNo);
   if (!offerListUrl) {
     return tmapiError(422, "member_id or a valid 1688 shop_url is required");
   }
@@ -350,7 +398,23 @@ export async function getShopItems({
     p.on("response", onResp);
 
     try {
+      if (!mid && shop_url) {
+        await p.goto(String(shop_url), {
+          waitUntil: "domcontentloaded",
+          timeout: 30_000,
+        });
+        assertNotLoginPage(p, "shop");
+        const source = await p.content();
+        const match =
+          source.match(/(?:memberId|member_id|sellerMemberId)["'\s:=\\]+(b2b-[a-z0-9_-]+)/i) ||
+          p.url().match(/[?&]memberId=(b2b-[^&]+)/i);
+        if (match?.[1]) {
+          mid = decodeURIComponent(match[1]);
+          offerListUrl = shopOfferListUrl("", mid, pageNo);
+        }
+      }
       await p.goto(offerListUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      assertNotLoginPage(p, "shop items");
       await sleep(3500);
       for (let i = 0; i < 5; i++) {
         await p.evaluate(() => window.scrollBy(0, 700));
@@ -440,6 +504,10 @@ export async function getShopItems({
       const start = (pageNo - 1) * size;
       const pageItems = items.slice(start, start + size);
 
+      if (!pageItems.length) {
+        return tmapiError(502, "No shop products were extracted from 1688");
+      }
+
       if (lang === "en" && pageItems.length) {
         const titles = await translateTexts(pageItems.map((i) => i.title || i.item_id));
         for (let i = 0; i < pageItems.length; i++) {
@@ -486,6 +554,7 @@ export async function getShopInfo({ shop_url, member_id, language = "zh" } = {})
     const page = await context.newPage();
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      assertNotLoginPage(page, "shop info");
       await sleep(3000);
       const info = await page.evaluate((memberId) => {
         const text = document.body?.innerText || "";
@@ -544,6 +613,7 @@ export async function getShopCategories({
     const page = await context.newPage();
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      assertNotLoginPage(page, "shop categories");
       await sleep(3000);
       const cats = await page.evaluate(() => {
         const out = [];
@@ -572,10 +642,14 @@ export async function getShopCategories({
         }
         return out;
       });
+      if (!cats.length) {
+        return tmapiError(502, "No shop categories were extracted from 1688");
+      }
       return tmapiOk({
         member_id: mid,
         shop_url: url,
         categories: cats,
+        list: cats,
       });
     } finally {
       await context.close();
@@ -718,6 +792,9 @@ export async function searchByImage({
       }
 
       const sliced = items.slice(0, size);
+      if (!sliced.length) {
+        return tmapiError(502, "Image search returned no products");
+      }
       return toTmapiSearch(
         { results: sliced, total: items.length },
         {
@@ -796,6 +873,24 @@ export async function searchFactories({
 export async function getCategoryInfo({ cat_id = "", language = "zh" } = {}) {
   const cat = String(cat_id || "").trim();
   const lang = normalizeLang(language);
+  if (!cat) return tmapiOk(TOP_CATEGORIES);
+
+  const known = knownCategory(cat);
+  if (known) {
+    const children = (KNOWN_CATEGORY_CHILDREN[cat] || []).map(([id, name]) => ({
+      id,
+      name,
+      name_en: name,
+      level: 1,
+      has_children: true,
+    }));
+    return tmapiOk({
+      ...known,
+      children,
+      path: [{ id: known.id, name: known.name, name_en: known.name_en }],
+      has_children: children.length > 0,
+    });
+  }
   const browser = await acquirePooledBrowser();
   try {
     const context = await newAuthedContext(browser, {
@@ -897,6 +992,17 @@ export async function getCategoryProducts({
 
   if (!cat) {
     return searchItemsTmapi({ keyword, page, page_size, sort, language });
+  }
+
+  const known = knownCategory(cat);
+  if (known) {
+    return searchItemsTmapi({
+      keyword: known.name_en,
+      page,
+      page_size,
+      sort,
+      language,
+    });
   }
 
   const browser = await acquirePooledBrowser();
