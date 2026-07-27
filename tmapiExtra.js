@@ -138,6 +138,10 @@ export function convertImageUrl(imgUrl, { width, height } = {}) {
   return tmapiOk({
     original: url,
     converted: out,
+    // Keep the native field and expose the names used by TMAPI clients.
+    url: out,
+    converted_url: out,
+    image_url: out,
     width: w,
     height: h,
   });

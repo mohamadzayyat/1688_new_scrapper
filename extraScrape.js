@@ -264,6 +264,25 @@ function extractMemberId(shop_url, member_id) {
   return m ? decodeURIComponent(m[1]) : "";
 }
 
+function shopOfferListUrl(shopUrl, memberId, pageNo) {
+  if (memberId) {
+    return `https://winport.m.1688.com/page/offerlist.html?memberId=${encodeURIComponent(memberId)}&pageNum=${pageNo}`;
+  }
+
+  const raw = String(shopUrl || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    const hostname = parsed.hostname.toLowerCase();
+    if (parsed.protocol !== "https:" || !(hostname === "1688.com" || hostname.endsWith(".1688.com"))) {
+      return "";
+    }
+    return `${parsed.origin}/page/offerlist.html?pageNum=${pageNo}`;
+  } catch {
+    return "";
+  }
+}
+
 function collectOfferIdsFromText(text, set) {
   if (!text) return;
   for (const m of String(text).matchAll(
@@ -296,12 +315,14 @@ export async function getShopItems({
   language = "zh",
 } = {}) {
   const mid = extractMemberId(shop_url, member_id);
-  if (!mid) return tmapiError(422, "member_id or shop_url is required");
 
   const lang = normalizeLang(language);
   const pageNo = Math.max(1, Number(page) || 1);
   const size = Math.min(50, Math.max(1, Number(page_size) || 20));
-  const offerListUrl = `https://winport.m.1688.com/page/offerlist.html?memberId=${encodeURIComponent(mid)}&pageNum=${pageNo}`;
+  const offerListUrl = shopOfferListUrl(shop_url, mid, pageNo);
+  if (!offerListUrl) {
+    return tmapiError(422, "member_id or a valid 1688 shop_url is required");
+  }
   const browser = await acquirePooledBrowser();
 
   try {

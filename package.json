@@ -12,6 +12,7 @@
     "scrape": "node cli.js",
     "search": "node cli.js --search",
     "login": "node cli.js --login",
+    "test:compat": "node scripts/test-tmapi-compat.js",
     "postinstall": "npx playwright install --with-deps chromium"
   },
   "engines": {

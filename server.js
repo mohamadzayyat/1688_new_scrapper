@@ -575,18 +575,24 @@ async function handleLegacySearch(req, res) {
 const ROUTES = [
   // Item APIs
   ["/1688/v2/item_detail", handleItemDetail],
+  // TMAPI-compatible aliases used by the Chibox backend.
+  ["/1688/item_detail", handleItemDetail],
+  ["/1688/global/item_detail", handleItemDetail],
   ["/api/1688/v2/item_detail", handleItemDetail],
   ["/1688/v2/item_detail_by_url", handleItemDetailByUrl],
   ["/api/1688/v2/item_detail_by_url", handleItemDetailByUrl],
   ["/1688/item_desc", handleItemDesc],
   ["/1688/item_review", handleItemReview],
+  ["/1688/item/rating", handleItemReview],
   ["/1688/item_reviews", handleItemReview],
   ["/1688/v2/item_review", handleItemReview],
   ["/1688/item_freight", handleItemFreight],
+  ["/1688/item/shipping", handleItemFreight],
   ["/1688/v2/item_freight", handleItemFreight],
 
   // Search APIs
   ["/1688/search/items", handleSearchItems],
+  ["/1688/global/search/items", handleSearchItems],
   ["/1688/search/items/v2", handleCrossSearchItems],
   ["/1688/v2/search/items", handleSearchItems],
   ["/1688/search/image", handleSearchImage],
@@ -607,17 +613,20 @@ const ROUTES = [
   ["/1688/shop/info", handleShopInfo],
   ["/1688/shop/shop_info", handleShopInfo],
   ["/1688/shop/cats", handleShopCats],
+  ["/1688/shop/category", handleShopCats],
   ["/1688/shop/categories", handleShopCats],
 
   // Category APIs
   ["/1688/category/info", handleCategoryInfo],
   ["/1688/v2/category/info", handleCategoryInfo],
   ["/1688/category/products", handleCategoryProducts],
+  ["/1688/category/items", handleCategoryProducts],
   ["/1688/category/products/v2", handleCategoryProducts],
   ["/1688/category/get_category_items", handleCategoryProducts],
 
   // Tools
   ["/1688/img/convert", handleImgConvert],
+  ["/1688/tools/image/convert_url", handleImgConvert],
   ["/1688/tools/img_convert", handleImgConvert],
   ["/1688/img_convert", handleImgConvert],
   ["/tools/parse/url", handleParseUrl],
