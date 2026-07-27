@@ -400,7 +400,7 @@ function rowsFrom(data, keys = ["items", "list"]) {
 }
 
 function inspectPagedCards(expectedPageSize) {
-  return (data) => {
+  return (data, provider) => {
     const issues = [];
     if (!isObject(data)) {
       return { issues: ["data is not an object"], profile: null };
@@ -440,8 +440,10 @@ function inspectPagedCards(expectedPageSize) {
     }
     if (total !== null && total >= 0) {
       const expectedCount = Math.min(expectedPageSize, total);
-      if (safeRows.length !== expectedCount) {
+      if (provider?.key === "new" && safeRows.length !== expectedCount) {
         issues.push("result count is inconsistent with page_size and total");
+      } else if (provider?.key === "old" && safeRows.length > expectedPageSize) {
+        issues.push("result count exceeds requested page_size");
       }
       const expectedNext = expectedPageSize < total;
       if (typeof data.has_next_page === "boolean" && data.has_next_page !== expectedNext) {
@@ -463,7 +465,11 @@ function inspectPagedCards(expectedPageSize) {
   };
 }
 
-function inspectDetail(data, expectedItemId = FIXTURE.itemId) {
+function inspectDetail(
+  data,
+  expectedItemId = FIXTURE.itemId,
+  { requireMoq = true } = {}
+) {
   const issues = [];
   if (!isObject(data)) return { issues: ["data is not an object"], profile: null };
   const id = itemId(data);
@@ -481,7 +487,7 @@ function inspectDetail(data, expectedItemId = FIXTURE.itemId) {
   const moq = finiteNumber(
     data.quantity_begin ?? data.moq ?? data.tiered_price_info?.begin_num
   );
-  if (moq === null || moq <= 0) issues.push("MOQ is missing or invalid");
+  if (requireMoq && (moq === null || moq <= 0)) issues.push("MOQ is missing or invalid");
   const stock = finiteNumber(data.stock ?? data.total_stock);
   if (stock === null || stock < 0) issues.push("stock is missing or invalid");
   const images = [
@@ -618,7 +624,8 @@ const ENDPOINTS = new Map([
       method: "GET",
       path: "/1688/item_detail",
       query: { item_id: FIXTURE.itemId, language: FIXTURE.language },
-      inspect: inspectDetail,
+      inspect: (data, provider) =>
+        inspectDetail(data, FIXTURE.itemId, { requireMoq: provider?.key === "new" }),
     },
   ],
   [
@@ -628,7 +635,8 @@ const ENDPOINTS = new Map([
       method: "GET",
       path: "/1688/global/item_detail",
       query: { item_id: FIXTURE.itemId, language: FIXTURE.language },
-      inspect: inspectDetail,
+      inspect: (data, provider) =>
+        inspectDetail(data, FIXTURE.itemId, { requireMoq: provider?.key === "new" }),
     },
   ],
   [
@@ -864,7 +872,7 @@ function evaluateResponse(raw, endpoint, provider) {
 
   let profile = null;
   if (!issues.length) {
-    const inspected = endpoint.inspect(raw.body.data);
+    const inspected = endpoint.inspect(raw.body.data, provider);
     issues.push(...inspected.issues);
     profile = inspected.profile;
   }
@@ -993,9 +1001,13 @@ function compareProfiles(oldResult, newResult) {
 
   if (oldProfile.kind === "detail") {
     const identityMatches = sameId(oldProfile.identity, newProfile.identity);
+    const moqMatches =
+      oldProfile.moq === null || oldProfile.moq === undefined
+        ? newProfile.moq !== null && newProfile.moq !== undefined
+        : oldProfile.moq === newProfile.moq;
     const valueMatches =
       relativeDifference(oldProfile.price, newProfile.price) <= PRICE_TOLERANCE &&
-      oldProfile.moq === newProfile.moq &&
+      moqMatches &&
       relativeDifference(oldProfile.stock, newProfile.stock) <= STOCK_TOLERANCE &&
       oldProfile.skuCount === newProfile.skuCount;
     return {
@@ -1222,7 +1234,8 @@ async function measureDistinctDetails(pairedResults) {
     method: "GET",
     path: "/1688/item_detail",
     query: { item_id: id, language: FIXTURE.language },
-    inspect: (data) => inspectDetail(data, id),
+    inspect: (data, provider) =>
+      inspectDetail(data, id, { requireMoq: provider?.key === "new" }),
     itemId: id,
   }));
   const rounds = [

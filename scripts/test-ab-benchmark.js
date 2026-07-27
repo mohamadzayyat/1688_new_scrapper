@@ -91,7 +91,7 @@ function requestKey(url) {
 
 function responseData(key, url, options) {
   if (key === "item_detail" || key === "global_item_detail") {
-    return {
+    const detail = {
       item_id: ITEM_ID,
       title: "mock item detail",
       price: "10.00",
@@ -101,6 +101,8 @@ function responseData(key, url, options) {
       sku_props: [{ pid: "1", values: [{ vid: "11", name: "black" }] }],
       skus: [{ sku_id: "sku-1", price: "10.00", stock: 50, props_ids: "1:11" }],
     };
+    if (options.legacyOld) delete detail.quantity_begin;
+    return detail;
   }
   if (key === "category_top") {
     return { items: [{ cat_id: CATEGORY_ID, name: "mock category" }] };
@@ -140,8 +142,12 @@ function responseData(key, url, options) {
     key === "text_search" && options.textSearchTotal != null
       ? options.textSearchTotal
       : pageSize;
+  const count =
+    options.legacyOld && key === "text_search"
+      ? Math.max(1, Math.min(pageSize, total) - 1)
+      : Math.min(pageSize, total);
   return {
-    items: Array.from({ length: Math.min(pageSize, total) }, (_, index) => card(index + 1)),
+    items: Array.from({ length: count }, (_, index) => card(index + 1)),
     page,
     page_size: pageSize,
     total_count: total,
@@ -154,7 +160,7 @@ function sendJson(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
-async function startMock({ token, delayMs, textSearchTotal }) {
+async function startMock({ token, delayMs, textSearchTotal, legacyOld = false }) {
   const seen = new Set();
   const server = http.createServer((request, response) => {
     const url = new URL(request.url, "http://127.0.0.1");
@@ -176,7 +182,7 @@ async function startMock({ token, delayMs, textSearchTotal }) {
       seen.add(key);
       sendJson(response, 200, {
         code: 200,
-        data: responseData(key, url, { textSearchTotal }),
+        data: responseData(key, url, { textSearchTotal, legacyOld }),
       });
     }, delayMs);
   });
@@ -262,6 +268,7 @@ async function runScenario(label, options) {
       token: oldToken,
       delayMs: options.oldDelayMs,
       textSearchTotal: options.oldTextSearchTotal,
+      legacyOld: Boolean(options.legacyOld),
     }),
     startMock({
       token: newToken,
@@ -308,6 +315,7 @@ try {
   scenario = await runScenario("all endpoints faster", {
     oldDelayMs: 40,
     newDelayMs: 2,
+    legacyOld: true,
   });
   assert.equal(
     scenario.result.code,
