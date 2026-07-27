@@ -49,6 +49,18 @@ try {
     if (Date.now() >= deadline) {
       throw new Error(`Login timed out after ${timeoutMs}ms`);
     }
+    const refreshed = await page
+      .evaluate(() => {
+        const bodyText = document.body?.innerText || "";
+        if (!/二维码已失效|QR code.*expired/i.test(bodyText)) return false;
+        const control = [...document.querySelectorAll("button,a,div,span")].find(
+          (element) => /刷新二维码|refresh.*QR/i.test(element.textContent || "")
+        );
+        control?.click();
+        return Boolean(control);
+      })
+      .catch(() => false);
+    if (refreshed) await page.waitForTimeout(1_000);
     await page.screenshot({ path: screenshotPath, fullPage: true });
     await page.waitForTimeout(5_000);
   }

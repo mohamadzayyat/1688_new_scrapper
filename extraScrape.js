@@ -106,7 +106,6 @@ export async function getItemDesc(itemId, { language = "zh" } = {}) {
     const { context, page } = await openOfferPage(browser, id, lang);
     try {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight * 0.7));
-      await sleep(1000);
 
       const extracted = await page.evaluate(async () => {
         const data = window.context?.result?.data || {};
@@ -184,7 +183,6 @@ export async function getItemReviews(
     const { context, page: p } = await openOfferPage(browser, id, lang);
     try {
       await p.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await sleep(1500);
       // try open reviews tab
       await p.evaluate(() => {
         const el = [...document.querySelectorAll("a,button,span,div")].find((n) =>
@@ -192,7 +190,16 @@ export async function getItemReviews(
         );
         el?.click();
       });
-      await sleep(1200);
+      await p
+        .waitForFunction(
+          () =>
+            document.querySelectorAll(
+              "[class*='review'], [class*='comment'], [class*='rate']"
+            ).length > 0,
+          null,
+          { timeout: 5_000 }
+        )
+        .catch(() => {});
 
       const reviews = await p.evaluate(() => {
         const out = [];
@@ -499,8 +506,6 @@ export async function getShopItems({
       hasTouch: true,
       locale: lang === "en" ? "en-US" : "zh-CN",
       viewport: { width: 390, height: 844 },
-      userAgent:
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
     });
     await withLangCookies(context, lang);
     const p = await context.newPage();
@@ -535,10 +540,20 @@ export async function getShopItems({
       }
       await p.goto(offerListUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
       assertNotLoginPage(p, "shop items");
-      await sleep(3500);
-      for (let i = 0; i < 5; i++) {
+      await p
+        .waitForFunction(
+          () =>
+            document.querySelectorAll(
+              "a[href*='offer/'], [offerid], [data-offer-id]"
+            ).length > 0,
+          null,
+          { timeout: 6_000 }
+        )
+        .catch(() => {});
+      assertNotLoginPage(p, "shop items");
+      for (let i = 0; i < 2; i++) {
         await p.evaluate(() => window.scrollBy(0, 700));
-        await sleep(400);
+        await sleep(200);
       }
 
       const scraped = await p.evaluate(() => {
@@ -693,8 +708,9 @@ export async function getShopInfo({ shop_url, member_id, language = "zh" } = {})
   const lang = normalizeLang(language);
   const url = `https://winport.m.1688.com/page/index.html?memberId=${encodeURIComponent(mid)}`;
   const browser = await acquirePooledBrowser();
+  let context = null;
   try {
-    const context = await newAuthedContext(browser, {
+    context = await newAuthedContext(browser, {
       isMobile: true,
       hasTouch: true,
       locale: lang === "en" ? "en-US" : "zh-CN",
@@ -705,7 +721,19 @@ export async function getShopInfo({ shop_url, member_id, language = "zh" } = {})
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
       assertNotLoginPage(page, "shop info");
-      await sleep(3000);
+      await page
+        .waitForFunction(
+          () =>
+            Boolean(
+              document.querySelector(
+                "h1,h2,[class*='company'],[class*='shop-name']"
+              )?.textContent?.trim()
+            ),
+          null,
+          { timeout: 5_000 }
+        )
+        .catch(() => {});
+      assertNotLoginPage(page, "shop info");
       const info = await page.evaluate((memberId) => {
         const text = document.body?.innerText || "";
         const title = document.title || "";
@@ -732,11 +760,12 @@ export async function getShopInfo({ shop_url, member_id, language = "zh" } = {})
       }, mid);
       return tmapiOk(info);
     } finally {
-      await context.close();
+      await page.close().catch(() => {});
     }
   } catch (err) {
     return tmapiError(500, err.message || "shop info failed");
   } finally {
+    if (context) await context.close().catch(() => {});
     releaseBrowser(browser);
   }
 }
@@ -752,8 +781,9 @@ export async function getShopCategories({
   const lang = normalizeLang(language);
   const url = `https://winport.m.1688.com/page/offerlist.html?memberId=${encodeURIComponent(mid)}`;
   const browser = await acquirePooledBrowser();
+  let context = null;
   try {
-    const context = await newAuthedContext(browser, {
+    context = await newAuthedContext(browser, {
       isMobile: true,
       hasTouch: true,
       locale: lang === "en" ? "en-US" : "zh-CN",
@@ -764,7 +794,17 @@ export async function getShopCategories({
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
       assertNotLoginPage(page, "shop categories");
-      await sleep(3000);
+      await page
+        .waitForFunction(
+          () =>
+            document.querySelectorAll(
+              "a[href*='cat'], a[href*='category'], [class*='category']"
+            ).length > 0,
+          null,
+          { timeout: 5_000 }
+        )
+        .catch(() => {});
+      assertNotLoginPage(page, "shop categories");
       const cats = await page.evaluate(() => {
         const out = [];
         const seen = new Set();
@@ -802,11 +842,12 @@ export async function getShopCategories({
         list: cats,
       });
     } finally {
-      await context.close();
+      await page.close().catch(() => {});
     }
   } catch (err) {
     return tmapiError(500, err.message || "shop categories failed");
   } finally {
+    if (context) await context.close().catch(() => {});
     releaseBrowser(browser);
   }
 }
@@ -878,9 +919,10 @@ export async function searchByImage({
   const pageNo = Math.max(1, Number(page) || 1);
   const size = Math.min(20, Math.max(1, Number(page_size) || 20));
   const browser = await acquirePooledBrowser();
+  let context = null;
 
   try {
-    const context = await newAuthedContext(browser, {
+    context = await newAuthedContext(browser, {
       locale: lang === "en" ? "en-US" : "zh-CN",
       viewport: { width: 1440, height: 900 },
     });
@@ -892,7 +934,16 @@ export async function searchByImage({
         encodeURIComponent(img) +
         `&beginPage=${pageNo}`;
       await p.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
-      await sleep(4000);
+      await p
+        .waitForFunction(
+          () =>
+            (window.data?.offerV2Showed?.offerList?.length || 0) > 0 ||
+            document.querySelectorAll("a[href*='offer/']").length > 0,
+          null,
+          { timeout: 8_000 }
+        )
+        .catch(() => {});
+      assertNotLoginPage(p, "image search");
 
       let items = await p.evaluate(() => {
         const list = window.data?.offerV2Showed?.offerList;
@@ -955,11 +1006,12 @@ export async function searchByImage({
         }
       );
     } finally {
-      await context.close();
+      await p.close().catch(() => {});
     }
   } catch (err) {
     return tmapiError(500, err.message || "image search failed");
   } finally {
+    if (context) await context.close().catch(() => {});
     releaseBrowser(browser);
   }
 }
@@ -1042,8 +1094,9 @@ export async function getCategoryInfo({ cat_id = "", language = "zh" } = {}) {
     });
   }
   const browser = await acquirePooledBrowser();
+  let context = null;
   try {
-    const context = await newAuthedContext(browser, {
+    context = await newAuthedContext(browser, {
       locale: lang === "en" ? "en-US" : "zh-CN",
       viewport: { width: 1440, height: 900 },
     });
@@ -1054,7 +1107,16 @@ export async function getCategoryInfo({ cat_id = "", language = "zh" } = {}) {
         ? `https://s.1688.com/selloffer/offer_search.htm?keywords=*&filt=y&n=y&categoryId=${encodeURIComponent(cat)}&beginPage=1`
         : `https://s.1688.com/selloffer/offer_search.htm?keywords=*&beginPage=1`;
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-      await sleep(4000);
+      await page
+        .waitForFunction(
+          () =>
+            Boolean(window.data) ||
+            document.querySelectorAll("a[href*='categoryId=']").length > 0,
+          null,
+          { timeout: 8_000 }
+        )
+        .catch(() => {});
+      assertNotLoginPage(page, "category info");
 
       const info = await page.evaluate((categoryId) => {
         const data = window.data || {};
@@ -1114,11 +1176,12 @@ export async function getCategoryInfo({ cat_id = "", language = "zh" } = {}) {
 
       return tmapiOk(info);
     } finally {
-      await context.close();
+      await page.close().catch(() => {});
     }
   } catch (err) {
     return tmapiError(500, err.message || "category info failed");
   } finally {
+    if (context) await context.close().catch(() => {});
     releaseBrowser(browser);
   }
 }
@@ -1166,7 +1229,14 @@ export async function getCategoryProducts({
       const url = `https://s.1688.com/selloffer/offer_search.htm?${params}`;
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
       assertNotLoginPage(page, "category products");
-      await sleep(4500);
+      await page
+        .waitForFunction(
+          () => (window.data?.offerV2Showed?.offerList?.length || 0) > 0,
+          null,
+          { timeout: 8_000 }
+        )
+        .catch(() => {});
+      assertNotLoginPage(page, "category products");
 
       let items = await page.evaluate(() => {
         const list = window.data?.offerV2Showed?.offerList || [];

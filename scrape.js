@@ -420,6 +420,9 @@ export async function getItemDetailById(
         return result;
       } catch (err) {
         lastError = err;
+        if (/login session|required login|login wall/i.test(err?.message || "")) {
+          break;
+        }
       } finally {
         await context.close().catch(() => {});
       }
@@ -443,13 +446,25 @@ async function scrapeOfferFast(
   /** @type {any} */
   let fromHtml = null;
   let htmlBytes = 0;
+  let loginWall = false;
 
   const onResponse = async (res) => {
     try {
       if (res.request().resourceType() !== "document") return;
+      if (/login\.(?:1688|taobao)\.com|member\/signin/i.test(res.url())) {
+        loginWall = true;
+        return;
+      }
       if (!res.url().includes(`/offer/${offerId}`)) return;
       const html = await res.text();
       htmlBytes = html.length;
+      if (
+        !html.includes("window.context=") &&
+        /login\.1688\.com\/member\/signin|login\.taobao\.com/i.test(html)
+      ) {
+        loginWall = true;
+        return;
+      }
       const ctx = parseOfferContextFromHtml(html);
       if (ctx) {
         const raw = contextToRawOffer(offerId, ctx);
@@ -469,11 +484,20 @@ async function scrapeOfferFast(
       timeout: Math.min(allowHydrate ? 18_000 : 12_000, remaining),
     });
 
+    if (
+      loginWall ||
+      /login\.(?:1688|taobao)\.com|member\/signin/i.test(page.url())
+    ) {
+      throw new Error(
+        "1688 login session is missing or expired; run npm run login:headless"
+      );
+    }
+
     const dataDeadline = Math.min(
       deadline,
       Date.now() + (allowHydrate ? 8_000 : 5_000)
     );
-    while (!fromHtml && Date.now() < dataDeadline) {
+    while (!fromHtml && !loginWall && Date.now() < dataDeadline) {
       await sleep(30);
       if (allowHydrate && !fromHtml) {
         const ready = await page
@@ -486,6 +510,11 @@ async function scrapeOfferFast(
           .catch(() => false);
         if (ready) break;
       }
+    }
+    if (loginWall) {
+      throw new Error(
+        "1688 login session is missing or expired; run npm run login:headless"
+      );
     }
     if (fromHtml) return fromHtml;
 
