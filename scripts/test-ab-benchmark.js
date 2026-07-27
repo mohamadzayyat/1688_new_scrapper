@@ -72,6 +72,11 @@ function card(index) {
   };
 }
 
+function isDistinctEvenDetail(url) {
+  const id = String(url.searchParams.get("item_id") || "");
+  return id && id !== ITEM_ID && Number(id.at(-1)) % 2 === 0;
+}
+
 function requestKey(url) {
   if (url.pathname === "/1688/item_detail") return "item_detail";
   if (url.pathname === "/1688/global/item_detail") return "global_item_detail";
@@ -93,8 +98,12 @@ function requestKey(url) {
 
 function responseData(key, url, options) {
   if (key === "item_detail" || key === "global_item_detail") {
+    const requestedItemId = String(url.searchParams.get("item_id") || ITEM_ID);
+    if (options.partialDistinctOld && isDistinctEvenDetail(url)) {
+      return { item_id: requestedItemId, legacy_unavailable: true };
+    }
     const detail = {
-      item_id: ITEM_ID,
+      item_id: requestedItemId,
       title: "mock item detail",
       price: "10.00",
       quantity_begin: 1,
@@ -167,11 +176,32 @@ function sendJson(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
-async function startMock({ token, delayMs, textSearchTotal, legacyOld = false }) {
+async function startMock({
+  token,
+  delayMs,
+  textSearchTotal,
+  legacyOld = false,
+  unavailableKeys = [],
+  intermittentUnavailableKeys = [],
+  partialDistinctOld = false,
+}) {
   const seen = new Set();
+  const counts = new Map();
+  const attempts = new Map();
+  const unavailable = new Set(unavailableKeys);
+  const intermittentUnavailable = new Set(intermittentUnavailableKeys);
   const server = http.createServer((request, response) => {
     const url = new URL(request.url, "http://127.0.0.1");
     const key = requestKey(url);
+    const attempt = (attempts.get(key) || 0) + 1;
+    attempts.set(key, attempt);
+    const unavailableForAttempt =
+      unavailable.has(key) ||
+      (intermittentUnavailable.has(key) && attempt % 2 === 0);
+    const requestDelay =
+      typeof delayMs === "function"
+        ? delayMs(key, url, attempt, unavailableForAttempt)
+        : delayMs;
     setTimeout(() => {
       if (url.searchParams.get("apiToken") !== token) {
         sendJson(response, 401, { code: 401, message: "unauthorized" });
@@ -187,11 +217,18 @@ async function startMock({ token, delayMs, textSearchTotal, legacyOld = false })
         return;
       }
       seen.add(key);
+      counts.set(key, (counts.get(key) || 0) + 1);
       sendJson(response, 200, {
         code: 200,
-        data: responseData(key, url, { textSearchTotal, legacyOld }),
+        data: unavailableForAttempt
+          ? { legacy_unavailable: true }
+          : responseData(key, url, {
+              textSearchTotal,
+              legacyOld,
+              partialDistinctOld,
+            }),
       });
-    }, delayMs);
+    }, requestDelay);
   });
 
   await new Promise((resolve, reject) => {
@@ -201,6 +238,7 @@ async function startMock({ token, delayMs, textSearchTotal, legacyOld = false })
   return {
     base: `http://127.0.0.1:${server.address().port}/`,
     seen,
+    counts,
     async close() {
       await new Promise((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
@@ -276,11 +314,16 @@ async function runScenario(label, options) {
       delayMs: options.oldDelayMs,
       textSearchTotal: options.oldTextSearchTotal,
       legacyOld: Boolean(options.legacyOld),
+      unavailableKeys: options.oldUnavailableKeys,
+      intermittentUnavailableKeys: options.oldIntermittentUnavailableKeys,
+      partialDistinctOld: Boolean(options.partialDistinctOld),
     }),
     startMock({
       token: newToken,
       delayMs: options.newDelayMs,
       textSearchTotal: options.newTextSearchTotal,
+      unavailableKeys: options.newUnavailableKeys,
+      intermittentUnavailableKeys: options.newIntermittentUnavailableKeys,
     }),
   ]);
 
@@ -293,7 +336,7 @@ async function runScenario(label, options) {
       OLD_AUTH_MODE: "query",
       NEW_AUTH_MODE: "query",
       AB_ALLOW_LOCAL_HTTP: "1",
-      AB_REQUIRE_DISTINCT_LOAD: "0",
+      AB_REQUIRE_DISTINCT_LOAD: options.requireDistinctLoad ? "1" : "0",
       AB_SAMPLES: "10",
       AB_WARMUPS: "0",
       AB_TIMEOUT_MS: "5000",
@@ -303,6 +346,9 @@ async function runScenario(label, options) {
       IMAGE_URL: ALIBABA_IMAGE,
       IMAGE_SEARCH_URL: ALIBABA_IMAGE,
     };
+    if (options.distinctDetailCount) {
+      overrides.AB_DISTINCT_DETAIL_COUNT = String(options.distinctDetailCount);
+    }
     if (options.endpoints) overrides.AB_ENDPOINTS = options.endpoints;
     const result = await runBenchmark(cleanBenchmarkEnv(overrides));
     assertTokensRedacted(label, result, [oldToken, newToken]);
@@ -336,8 +382,126 @@ try {
   );
   assert.deepEqual([...scenario.oldMock.seen].sort(), ALL_ENDPOINTS);
   assert.deepEqual([...scenario.newMock.seen].sort(), ALL_ENDPOINTS);
+  for (const endpoint of ALL_ENDPOINTS) {
+    assert.equal(
+      scenario.oldMock.counts.get(endpoint),
+      11,
+      `${endpoint} was not covered by OLD sequential plus concurrency phases`
+    );
+    assert.equal(
+      scenario.newMock.counts.get(endpoint),
+      11,
+      `${endpoint} was not covered by NEW sequential plus concurrency phases`
+    );
+  }
+  assert.match(scenario.result.stdout, /Raised concurrency requests from 4 to 14/);
   assert.match(scenario.result.stdout, /A\/B checks passed/);
   console.log("OK benchmark accepts a materially faster equivalent NEW across all 14 endpoints");
+} finally {
+  if (scenario) await closeScenario(scenario);
+}
+
+scenario = null;
+try {
+  scenario = await runScenario("availability only", {
+    endpoints: "category_top",
+    oldDelayMs: 40,
+    newDelayMs: 2,
+    legacyOld: true,
+  });
+  assert.equal(
+    scenario.result.code,
+    0,
+    `availability-only NEW should pass its strict contract\n${scenario.result.output}`
+  );
+  assert.match(scenario.result.stdout, /No relative-speed evidence is available/);
+  assert.match(scenario.result.stdout, /passed 1 endpoint contract/);
+  console.log("OK benchmark accepts and labels an availability-only endpoint selection");
+} finally {
+  if (scenario) await closeScenario(scenario);
+}
+
+scenario = null;
+try {
+  scenario = await runScenario("mixed availability concurrency", {
+    endpoints: "category_top,text_search",
+    legacyOld: true,
+    oldDelayMs: (key) => (key === "category_top" ? 1 : 30),
+    newDelayMs: (key) => (key === "category_top" ? 80 : 2),
+  });
+  assert.equal(
+    scenario.result.code,
+    0,
+    `OLD error latency must not poison common paired concurrency\n${scenario.result.output}`
+  );
+  assert.match(scenario.result.stdout, /concurrency batch comparison skipped/i);
+  assert.match(scenario.result.stdout, /passed 1 endpoint contract/);
+  console.log("OK benchmark compares mixed concurrency only on paired-valid responses");
+} finally {
+  if (scenario) await closeScenario(scenario);
+}
+
+scenario = null;
+try {
+  scenario = await runScenario("intermittent old availability", {
+    endpoints: "text_search",
+    oldIntermittentUnavailableKeys: ["text_search"],
+    oldDelayMs: (_key, _url, _attempt, unavailable) =>
+      unavailable ? 1 : 30,
+    newDelayMs: (_key, _url, attempt) => (attempt % 2 === 0 ? 80 : 2),
+  });
+  assert.equal(
+    scenario.result.code,
+    0,
+    `intermittent OLD failures must not poison paired-valid sequential p95\n${scenario.result.output}`
+  );
+  assert.match(scenario.result.stdout, /A\/B checks passed/);
+  console.log("OK intermittent OLD failures do not poison paired-valid sequential p95");
+} finally {
+  if (scenario) await closeScenario(scenario);
+}
+
+scenario = null;
+try {
+  scenario = await runScenario("unavailable old search distinct", {
+    endpoints: "text_search",
+    oldDelayMs: 30,
+    newDelayMs: 2,
+    oldUnavailableKeys: ["text_search"],
+    requireDistinctLoad: true,
+    distinctDetailCount: 4,
+  });
+  assert.equal(
+    scenario.result.code,
+    0,
+    `NEW search IDs should drive distinct detail load when OLD search is unavailable\n${scenario.result.output}`
+  );
+  assert.match(scenario.result.stdout, /Distinct item-detail workload: 4 IDs/);
+  assert.doesNotMatch(scenario.result.output, /Distinct load needs/);
+  console.log("OK distinct load fills live IDs from NEW when OLD search is unavailable");
+} finally {
+  if (scenario) await closeScenario(scenario);
+}
+
+scenario = null;
+try {
+  scenario = await runScenario("partial old distinct availability", {
+    endpoints: "text_search",
+    partialDistinctOld: true,
+    requireDistinctLoad: true,
+    distinctDetailCount: 4,
+    oldDelayMs: (key, url) =>
+      key === "item_detail" && isDistinctEvenDetail(url) ? 1 : 30,
+    newDelayMs: (key, url) =>
+      key === "item_detail" && isDistinctEvenDetail(url) ? 80 : 2,
+  });
+  assert.equal(
+    scenario.result.code,
+    0,
+    `partial OLD detail failures must not poison paired-valid p95/batch gates\n${scenario.result.output}`
+  );
+  assert.match(scenario.result.stdout, /Distinct detail batch comparison skipped/);
+  console.log("OK partial OLD distinct failures do not poison paired-valid speed gates");
 } finally {
   if (scenario) await closeScenario(scenario);
 }

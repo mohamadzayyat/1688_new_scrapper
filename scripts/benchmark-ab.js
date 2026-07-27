@@ -1114,6 +1114,30 @@ function providerStats(results) {
   };
 }
 
+function availabilityOnly(oldStats, newStats) {
+  return (
+    oldStats.valid === 0 &&
+    newStats.attempts > 0 &&
+    newStats.valid === newStats.attempts
+  );
+}
+
+function pairedLatencyStats(pairs) {
+  const validPairs = pairs.filter(
+    (pair) =>
+      pair.comparable &&
+      Number.isFinite(pair.oldMs) &&
+      Number.isFinite(pair.newMs)
+  );
+  return {
+    pairs: validPairs,
+    oldP50: percentile(validPairs.map((pair) => pair.oldMs), 50),
+    newP50: percentile(validPairs.map((pair) => pair.newMs), 50),
+    oldP95: percentile(validPairs.map((pair) => pair.oldMs), 95),
+    newP95: percentile(validPairs.map((pair) => pair.newMs), 95),
+  };
+}
+
 function ratioDisplay(numerator, denominator) {
   if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0) return "-";
   return `${(numerator / denominator).toFixed(2)}x`;
@@ -1180,18 +1204,36 @@ async function runBounded(tasks, limit, worker) {
 }
 
 async function measureConcurrency() {
+  const effectiveRequestCount = Math.max(
+    CONCURRENCY_REQUESTS,
+    SELECTED_ENDPOINTS.length
+  );
   const tasks = Array.from(
-    { length: CONCURRENCY_REQUESTS },
+    { length: effectiveRequestCount },
     (_, index) => SELECTED_ENDPOINTS[index % SELECTED_ENDPOINTS.length]
   );
-  const aggregate = { old: [], new: [], oldPhases: [], newPhases: [] };
+  const aggregate = {
+    old: [],
+    new: [],
+    oldPhases: [],
+    newPhases: [],
+    pairs: [],
+    effectiveRequestCount,
+  };
 
   console.log(
-    `\nPost-measurement cache/API concurrency phase: ${CONCURRENCY_REQUESTS} requests/provider/round, ` +
+    `\nPost-measurement cache/API concurrency phase: ${effectiveRequestCount} requests/provider/round, ` +
       `concurrency=${CONCURRENCY}, rounds=${CONCURRENCY_ROUNDS}`
   );
+  if (effectiveRequestCount !== CONCURRENCY_REQUESTS) {
+    console.log(
+      `Raised concurrency requests from ${CONCURRENCY_REQUESTS} to ${effectiveRequestCount} ` +
+        "so every selected endpoint is covered."
+    );
+  }
   for (let round = 0; round < CONCURRENCY_ROUNDS; round += 1) {
     const order = round % 2 === 0 ? [PROVIDERS.old, PROVIDERS.new] : [PROVIDERS.new, PROVIDERS.old];
+    const roundResults = {};
     for (const provider of order) {
       const started = performance.now();
       const results = await runBounded(tasks, CONCURRENCY, (endpoint) =>
@@ -1200,11 +1242,27 @@ async function measureConcurrency() {
       const elapsed = performance.now() - started;
       aggregate[provider.key].push(...results);
       aggregate[`${provider.key}Phases`].push(elapsed);
+      roundResults[provider.key] = results;
       const valid = results.filter((result) => result.validation.ok).length;
       console.log(
         `  round ${round + 1} ${provider.label}: valid=${valid}/${results.length} ` +
           `batch=${Math.round(elapsed)}ms`
       );
+    }
+    for (let index = 0; index < tasks.length; index += 1) {
+      const oldResult = roundResults.old[index];
+      const newResult = roundResults.new[index];
+      aggregate.pairs.push({
+        endpoint: tasks[index].key,
+        comparable: Boolean(
+          oldResult?.validation?.ok && newResult?.validation?.ok
+        ),
+        availabilityWin: Boolean(
+          !oldResult?.validation?.ok && newResult?.validation?.ok
+        ),
+        oldMs: oldResult?.ms,
+        newMs: newResult?.ms,
+      });
     }
   }
   return aggregate;
@@ -1217,22 +1275,36 @@ function resultItemIds(result) {
     .filter((id) => /^\d+$/.test(id));
 }
 
-function commonDistinctItemIds(pairedResults) {
+function distinctItemIds(pairedResults) {
   const textResults = pairedResults.get("text_search");
   if (!textResults) return [];
   const oldIds = new Set(textResults.oldResults.flatMap(resultItemIds));
-  const newIds = new Set(textResults.newResults.flatMap(resultItemIds));
-  return [...oldIds]
-    .filter((id) => id !== FIXTURE.itemId && newIds.has(id))
-    .slice(0, DISTINCT_DETAIL_COUNT);
+  const newIds = [
+    ...new Set(textResults.newResults.flatMap(resultItemIds)),
+  ].filter((id) => id !== FIXTURE.itemId);
+  const selected = [];
+  const seen = new Set();
+  const add = (id) => {
+    if (!id || seen.has(id) || selected.length >= DISTINCT_DETAIL_COUNT) return;
+    seen.add(id);
+    selected.push(id);
+  };
+  // Prefer IDs independently discovered by both providers. When an OLD
+  // search route is unavailable, NEW's live IDs are still safe identical
+  // inputs for the subsequent OLD/NEW item-detail requests.
+  for (const id of newIds) {
+    if (oldIds.has(id)) add(id);
+  }
+  for (const id of newIds) add(id);
+  return selected;
 }
 
 async function measureDistinctDetails(pairedResults) {
   if (!REQUIRE_DISTINCT_LOAD) return null;
-  const ids = commonDistinctItemIds(pairedResults);
+  const ids = distinctItemIds(pairedResults);
   if (ids.length < DISTINCT_DETAIL_COUNT) {
     throw configError(
-      `Distinct load needs ${DISTINCT_DETAIL_COUNT} common text-search item IDs; found ${ids.length}. ` +
+      `Distinct load needs ${DISTINCT_DETAIL_COUNT} live NEW text-search item IDs; found ${ids.length}. ` +
         "Choose a broader KEYWORD or lower AB_DISTINCT_DETAIL_COUNT (minimum 4)."
     );
   }
@@ -1289,6 +1361,11 @@ async function measureDistinctDetails(pairedResults) {
     const newResult = byProviderAndId.new.get(id);
     aggregate.pairs.push({
       ...compareProfiles(oldResult, newResult),
+      oldValid: Boolean(oldResult?.validation?.ok),
+      newValid: Boolean(newResult?.validation?.ok),
+      availabilityWin: Boolean(
+        !oldResult?.validation?.ok && newResult?.validation?.ok
+      ),
       oldMs: oldResult.ms,
       newMs: newResult.ms,
       latencyRatio: oldResult.ms > 0 ? newResult.ms / oldResult.ms : null,
@@ -1342,13 +1419,14 @@ function printPairedReport(results) {
       .filter((pair) => Number.isFinite(pair.latencyDelta))
       .map((pair) => pair.latencyDelta);
     const newWins = validLatencyPairs.filter((pair) => pair.newMs < pair.oldMs).length;
+    const pairedTiming = pairedLatencyStats(pairs);
     comparisons.push({
       endpoint: endpoint.key,
       comparable: `${comparable.length}/${pairs.length}`,
       equivalent: `${equivalent.length}/${comparable.length || 0}`,
       overlap_p50: overlaps.length ? `${Math.round(percentile(overlaps, 50) * 100)}%` : "-",
-      new_old_p50: ratioDisplay(newStats.p50, oldStats.p50),
-      new_old_p95: ratioDisplay(newStats.p95, oldStats.p95),
+      new_old_p50: ratioDisplay(pairedTiming.newP50, pairedTiming.oldP50),
+      new_old_p95: ratioDisplay(pairedTiming.newP95, pairedTiming.oldP95),
       paired_ratio_p50: latencyRatios.length ? `${percentile(latencyRatios, 50).toFixed(2)}x` : "-",
       paired_delta_p50_ms: rounded(percentile(latencyDeltas, 50)),
       new_wins: `${newWins}/${validLatencyPairs.length}`,
@@ -1416,8 +1494,7 @@ function assessDistinctDetails(aggregate) {
   const comparable = aggregate.pairs.filter((pair) => pair.comparable);
   const equivalent = comparable.filter((pair) => pair.ok);
   const equivalenceRate = comparable.length ? equivalent.length / comparable.length : 0;
-  const oldUnavailableButNewValid =
-    oldStats.valid === 0 && newStats.successRate >= MIN_NEW_SUCCESS_RATE;
+  const oldUnavailableButNewValid = availabilityOnly(oldStats, newStats);
   if (
     (!comparable.length && !oldUnavailableButNewValid) ||
     (comparable.length && equivalenceRate < MIN_EQUIV_RATE)
@@ -1428,7 +1505,8 @@ function assessDistinctDetails(aggregate) {
     );
   }
 
-  const ratios = comparable
+  const pairedTiming = pairedLatencyStats(aggregate.pairs);
+  const ratios = pairedTiming.pairs
     .map((pair) => pair.latencyRatio)
     .filter((value) => Number.isFinite(value));
   const pairedP50 = percentile(ratios, 50);
@@ -1443,14 +1521,15 @@ function assessDistinctDetails(aggregate) {
   }
   if (
     MAX_NEW_P95_RATIO !== null &&
-    oldStats.p95 !== null &&
-    newStats.p95 !== null &&
-    newStats.p95 > oldStats.p95 * MAX_NEW_P95_RATIO + P95_SLACK_MS
+    pairedTiming.oldP95 !== null &&
+    pairedTiming.newP95 !== null &&
+    pairedTiming.newP95 >
+      pairedTiming.oldP95 * MAX_NEW_P95_RATIO + P95_SLACK_MS
   ) {
     failures.push("distinct details NEW p95 exceeds configured OLD-relative limit");
   }
-  const wins = comparable.filter((pair) => pair.newMs < pair.oldMs).length;
-  const winRate = comparable.length ? wins / comparable.length : 0;
+  const wins = pairedTiming.pairs.filter((pair) => pair.newMs < pair.oldMs).length;
+  const winRate = pairedTiming.pairs.length ? wins / pairedTiming.pairs.length : 0;
   if (!oldUnavailableButNewValid && winRate < MIN_NEW_WIN_RATE) {
     failures.push(
       `distinct details NEW win rate ${(winRate * 100).toFixed(0)}% is below ` +
@@ -1459,12 +1538,27 @@ function assessDistinctDetails(aggregate) {
   }
   const oldBatch = aggregate.oldPhases.reduce((sum, value) => sum + value, 0);
   const newBatch = aggregate.newPhases.reduce((sum, value) => sum + value, 0);
+  const fullyComparableBatch =
+    aggregate.pairs.length > 0 &&
+    aggregate.pairs.every((pair) => pair.oldValid && pair.newValid);
   if (
-    !oldUnavailableButNewValid &&
+    fullyComparableBatch &&
     MAX_CONCURRENCY_RATIO !== null &&
     newBatch > oldBatch * MAX_CONCURRENCY_RATIO + CONCURRENCY_SLACK_MS
   ) {
     failures.push("distinct details NEW total batch latency exceeds configured OLD-relative limit");
+  }
+  if (!fullyComparableBatch && aggregate.pairs.some((pair) => pair.availabilityWin)) {
+    console.log(
+      "Distinct detail batch comparison skipped because OLD-unavailable requests " +
+        "are not a valid latency baseline."
+    );
+  }
+  if (oldUnavailableButNewValid) {
+    console.log(
+      "Distinct detail workload is an availability-only win; no relative-speed " +
+        "evidence exists for that workload."
+    );
   }
   return failures;
 }
@@ -1497,8 +1591,7 @@ function assess(results, concurrencyResults) {
     allValidPairs.push(...comparable);
     const equivalent = comparable.filter((pair) => pair.ok);
     const equivalenceRate = comparable.length ? equivalent.length / comparable.length : 0;
-    const oldUnavailableButNewValid =
-      oldStats.valid === 0 && newStats.successRate >= MIN_NEW_SUCCESS_RATE;
+    const oldUnavailableButNewValid = availabilityOnly(oldStats, newStats);
     if (oldUnavailableButNewValid) availabilityWins += 1;
     if (
       (!comparable.length && !oldUnavailableButNewValid) ||
@@ -1509,15 +1602,18 @@ function assess(results, concurrencyResults) {
       );
     }
 
-    if (oldStats.p95 !== null && newStats.p95 !== null) {
+    const pairedTiming = pairedLatencyStats(pairs);
+    if (pairedTiming.oldP95 !== null && pairedTiming.newP95 !== null) {
       measuredP95 += 1;
-      if (newStats.p95 < oldStats.p95) newP95Wins += 1;
+      if (pairedTiming.newP95 < pairedTiming.oldP95) newP95Wins += 1;
       if (
         MAX_NEW_P95_RATIO !== null &&
-        newStats.p95 > oldStats.p95 * MAX_NEW_P95_RATIO + P95_SLACK_MS
+        pairedTiming.newP95 >
+          pairedTiming.oldP95 * MAX_NEW_P95_RATIO + P95_SLACK_MS
       ) {
         failures.push(
-          `${endpoint.key} NEW p95 ${Math.round(newStats.p95)}ms exceeds configured OLD-relative limit`
+          `${endpoint.key} NEW paired-valid p95 ${Math.round(pairedTiming.newP95)}ms ` +
+            "exceeds configured OLD-relative limit"
         );
       }
     }
@@ -1551,22 +1647,38 @@ function assess(results, concurrencyResults) {
 
   const oldBatchP50 = percentile(concurrencyResults.oldPhases, 50);
   const newBatchP50 = percentile(concurrencyResults.newPhases, 50);
+  const concurrencyTiming = pairedLatencyStats(concurrencyResults.pairs || []);
   if (
     MAX_CONCURRENCY_RATIO !== null &&
-    concurrencyStats.old.p95 !== null &&
-    concurrencyStats.new.p95 !== null &&
-    concurrencyStats.new.p95 >
-      concurrencyStats.old.p95 * MAX_CONCURRENCY_RATIO + CONCURRENCY_SLACK_MS
+    concurrencyTiming.oldP95 !== null &&
+    concurrencyTiming.newP95 !== null &&
+    concurrencyTiming.newP95 >
+      concurrencyTiming.oldP95 * MAX_CONCURRENCY_RATIO + CONCURRENCY_SLACK_MS
   ) {
-    failures.push("NEW cache/API concurrency p95 exceeds configured OLD-relative limit");
+    failures.push(
+      "NEW cache/API paired-valid concurrency p95 exceeds configured OLD-relative limit"
+    );
   }
+  const fullyComparableConcurrencyBatch =
+    concurrencyResults.pairs?.length > 0 &&
+    concurrencyResults.pairs.every((pair) => pair.comparable);
   if (
+    fullyComparableConcurrencyBatch &&
     MAX_CONCURRENCY_RATIO !== null &&
     oldBatchP50 !== null &&
     newBatchP50 !== null &&
     newBatchP50 > oldBatchP50 * MAX_CONCURRENCY_RATIO + CONCURRENCY_SLACK_MS
   ) {
     failures.push("NEW cache/API concurrency batch latency exceeds configured OLD-relative limit");
+  }
+  if (
+    !fullyComparableConcurrencyBatch &&
+    concurrencyResults.pairs?.some((pair) => pair.availabilityWin)
+  ) {
+    console.log(
+      "Cache/API concurrency batch comparison skipped because OLD-unavailable " +
+        "requests are not a valid latency baseline; paired-valid p95 remains enforced."
+    );
   }
 
   const validLatencyPairs = allValidPairs.filter(
@@ -1576,7 +1688,10 @@ function assess(results, concurrencyResults) {
   const overallWinRate = validLatencyPairs.length
     ? overallWins / validLatencyPairs.length
     : 0;
-  if (!validLatencyPairs.length || overallWinRate < MIN_NEW_WIN_RATE) {
+  if (
+    (!validLatencyPairs.length && availabilityWins === 0) ||
+    (validLatencyPairs.length > 0 && overallWinRate < MIN_NEW_WIN_RATE)
+  ) {
     failures.push(
       `NEW paired latency win rate ${(overallWinRate * 100).toFixed(0)}% is below ` +
         `${(MIN_NEW_WIN_RATE * 100).toFixed(0)}%`
@@ -1587,10 +1702,17 @@ function assess(results, concurrencyResults) {
     `\nObserved NEW p95 was lower on ${newP95Wins}/${measuredP95} comparable endpoints. ` +
       "This describes this run only; it is not a controlled cold-cache claim."
   );
-  console.log(
-    `Observed NEW won ${overallWins}/${validLatencyPairs.length} valid paired requests ` +
-      `(${(overallWinRate * 100).toFixed(0)}%).`
-  );
+  if (validLatencyPairs.length) {
+    console.log(
+      `Observed NEW won ${overallWins}/${validLatencyPairs.length} valid paired requests ` +
+        `(${(overallWinRate * 100).toFixed(0)}%).`
+    );
+  } else if (availabilityWins) {
+    console.log(
+      "No relative-speed evidence is available because OLD had no valid responses " +
+        "for the selected endpoint contracts."
+    );
+  }
   if (availabilityWins) {
     console.log(
       `NEW also passed ${availabilityWins} endpoint contract(s) where OLD had zero valid responses.`
@@ -1640,7 +1762,7 @@ async function main() {
       "\nA/B checks passed for response contracts, equivalence, configured success rates, " +
         (MAX_NEW_P95_RATIO === null
           ? "and reported latency observations."
-          : "and the observed-latency regression gate.")
+          : "and all applicable observed-latency regression gates.")
     );
     if (MAX_NEW_P95_RATIO === null) {
       console.log("No performance threshold was enforced; set AB_MAX_NEW_P95_RATIO to add one.");
