@@ -49,18 +49,21 @@ try {
     if (Date.now() >= deadline) {
       throw new Error(`Login timed out after ${timeoutMs}ms`);
     }
-    const refreshed = await page
-      .evaluate(() => {
-        const bodyText = document.body?.innerText || "";
-        if (!/二维码已失效|QR code.*expired/i.test(bodyText)) return false;
-        const control = [...document.querySelectorAll("button,a,div,span")].find(
-          (element) => /刷新二维码|refresh.*QR/i.test(element.textContent || "")
-        );
-        control?.click();
-        return Boolean(control);
-      })
+    const expired = await page
+      .evaluate(() =>
+        /二维码已失效|QR code.*expired/i.test(document.body?.innerText || "")
+      )
       .catch(() => false);
-    if (refreshed) await page.waitForTimeout(1_000);
+    if (expired) {
+      // The visible "refresh QR" overlay is not reliably clickable in
+      // headless Chromium. Reloading the sign-in page always requests a new
+      // QR challenge and avoids repeatedly screenshotting the expired frame.
+      await page.reload({
+        waitUntil: "domcontentloaded",
+        timeout: 30_000,
+      });
+      await page.waitForTimeout(1_000);
+    }
     await page.screenshot({ path: screenshotPath, fullPage: true });
     await page.waitForTimeout(5_000);
   }
