@@ -22,7 +22,7 @@ import {
   searchByImageCrossBorder,
 } from "./extraScrape.js";
 import { enqueueJob, jobQueueStats, recommendedHardware } from "./jobQueue.js";
-import { cacheKey, cached, cacheStats } from "./cache.js";
+import { cacheKey, cached, cachedSwr, cacheStats } from "./cache.js";
 import { warmBrowserPool, browserPoolStats } from "./browser.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -38,7 +38,11 @@ const MIME = {
   ".ico": "image/x-icon",
 };
 
-const ITEM_CACHE_TTL = Math.max(10_000, Number(process.env.ITEM_CACHE_TTL_MS) || 120_000);
+// Fresh TTL — longer + disk SWR so repeat item_detail stays << 1s
+const ITEM_CACHE_TTL = Math.max(
+  30_000,
+  Number(process.env.ITEM_CACHE_TTL_MS) || 30 * 60 * 1000
+);
 const SEARCH_CACHE_TTL = Math.max(5_000, Number(process.env.SEARCH_CACHE_TTL_MS) || 60_000);
 
 function sendJson(res, status, body) {
@@ -80,11 +84,12 @@ async function serveStatic(req, res) {
  * Concurrent job runner (queue) — up to MAX_CONCURRENT scrapes in parallel.
  * Instant tools (parse/convert) should NOT use this.
  */
-async function withJob(res, label, fn, { tmapi = true, cacheTtl = 0, cacheParts = null } = {}) {
+async function withJob(res, label, fn, { tmapi = true, cacheTtl = 0, cacheParts = null, swr = false } = {}) {
   try {
     const run = async () => {
       if (cacheTtl > 0 && cacheParts) {
         const key = cacheKey(cacheParts);
+        if (swr) return cachedSwr(key, cacheTtl, fn);
         return cached(key, cacheTtl, fn);
       }
       return fn();
@@ -158,6 +163,7 @@ async function handleItemDetail(req, res) {
       tmapi: true,
       cacheTtl: ITEM_CACHE_TTL,
       cacheParts: ["item_detail", itemId, language, optimizeTitle],
+      swr: true,
     }
   );
 }
@@ -197,6 +203,7 @@ async function handleItemDetailByUrl(req, res) {
       tmapi: true,
       cacheTtl: ITEM_CACHE_TTL,
       cacheParts: ["item_detail", itemId, language, optimizeTitle],
+      swr: true,
     }
   );
 }

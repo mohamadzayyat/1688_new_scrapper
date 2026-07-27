@@ -5,6 +5,12 @@ import { pathToFileURL } from "node:url";
 import { launchBrowser, acquirePooledBrowser, releaseBrowser, newFastContext } from "./browser.js";
 import { toTmapiItemDetail, tmapiError } from "./tmapiFormat.js";
 import { AUTH_PATH, hasSavedAuth } from "./auth.js";
+import {
+  parseOfferContextFromHtml,
+  contextToRawOffer,
+  isUsableRawOffer,
+} from "./offerContext.js";
+import { translateItemDetailData } from "./translate.js";
 
 function usage(exitCode = 1) {
   console.error(`Usage:
@@ -320,6 +326,9 @@ async function waitForEnglishTranslation(page, timeoutMs = 25_000) {
  * TMAPI-compatible: Get 1688 product details by ID.
  * Returns exactly { code, msg, data } like
  * https://tmapi.top/docs/ali/item-detail/get-item-detail-by-id
+ *
+ * Fast path: parse `window.context` from the HTML document as soon as it
+ * arrives (no DOM waits / on-page translator). Falls back to full page scrape.
  */
 export async function getItemDetailById(
   itemId,
@@ -337,111 +346,142 @@ export async function getItemDetailById(
     ? await launchBrowser({ headed: true })
     : await acquirePooledBrowser();
 
+  const buildContextOpts = () => ({
+    locale: "zh-CN",
+    viewport: { width: 1280, height: 800 },
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    extraHTTPHeaders: {
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    },
+  });
+
   try {
-    const contextOpts = {
-      locale: lang === "en" ? "en-US" : "zh-CN",
-      viewport: { width: 1280, height: 800 },
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-      extraHTTPHeaders: {
-        "Accept-Language":
-          lang === "en"
-            ? "en-US,en;q=0.9,zh-CN;q=0.5"
-            : "zh-CN,zh;q=0.9,en;q=0.8",
-      },
-    };
-    if (!headed && (await hasSavedAuth())) {
-      contextOpts.storageState = AUTH_PATH;
-    }
-
-    const context = headed
-      ? await browser.newContext(contextOpts)
-      : await newFastContext(browser, { ...contextOpts, blockAssets: true });
-
-    await context.addCookies([
-      {
-        name: "oversealanguage",
-        value: lang === "en" ? "en" : "zh-CN",
-        domain: ".1688.com",
-        path: "/",
-      },
-    ]);
-
-    const page = await context.newPage();
     let lastError;
 
-    try {
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        try {
-          await page.goto(url, {
-            waitUntil: "domcontentloaded",
-            timeout: 45_000,
-          });
-          await waitForOfferData(page, 35_000);
-          if (lang === "en") {
-            await waitForEnglishTranslation(page, 12_000);
-          }
-          await page.evaluate(() =>
-            window.scrollTo(0, document.body.scrollHeight * 0.4)
-          );
-          await page
-            .waitForFunction(
-              () =>
-                /全部参数|商品参数|Product Attributes|材质|品牌/.test(
-                  document.body?.innerText || ""
-                ),
-              null,
-              { timeout: 6_000 }
-            )
-            .catch(() => {});
-          await page
-            .evaluate(() => {
-              const nodes = Array.from(
-                document.querySelectorAll("a,button,span,div")
-              );
-              const btn = nodes.find((el) =>
-                /全部参数|查看全部参数|Product Attributes/.test(
-                  (el.textContent || "").trim()
-                )
-              );
-              if (btn) btn.click();
-            })
-            .catch(() => {});
-          await sleep(350);
-
-          const raw = await extractRawOffer(page, offerId);
-          if (!raw.title && !raw.skuModel && !raw.mainPrice) {
-            throw new Error("Could not find product data on the page");
-          }
-
-          if (optimize_title && lang === "zh" && raw.title) {
-            raw.title = String(raw.title)
-              .replace(/\s+/g, " ")
-              .replace(/(批发|厂家|直销|包邮)/g, "")
-              .trim();
-          }
-
-          const result = toTmapiItemDetail(raw);
-          const durationSeconds = Number(
-            ((Date.now() - startedAt) / 1000).toFixed(2)
-          );
-          console.error(
-            `[timing] item_detail ${offerId} (${lang}) ${durationSeconds}s`
-          );
-          return result;
-        } catch (err) {
-          lastError = err;
-          if (attempt === 2) break;
-          await sleep(600);
-        }
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const contextOpts = buildContextOpts();
+      if (!headed && (await hasSavedAuth())) {
+        contextOpts.storageState = AUTH_PATH;
       }
-      return tmapiError(500, lastError?.message || "Scrape failed");
-    } finally {
-      await context.close().catch(() => {});
+
+      // Attempt 1: document-only (fastest). Attempt 2: allow page JS hydrate.
+      const documentOnly = !headed && attempt === 1;
+      const context = headed
+        ? await browser.newContext(contextOpts)
+        : await newFastContext(browser, {
+            ...contextOpts,
+            blockAssets: true,
+            documentOnly,
+          });
+
+      await context.addCookies([
+        {
+          name: "oversealanguage",
+          value: "zh-CN",
+          domain: ".1688.com",
+          path: "/",
+        },
+      ]);
+
+      const page = await context.newPage();
+      try {
+        const raw = await scrapeOfferFast(page, offerId, url, {
+          allowHydrate: !documentOnly,
+        });
+        if (!isUsableRawOffer(raw)) {
+          throw new Error("Could not find product data on the page");
+        }
+
+        if (optimize_title && raw.title) {
+          raw.title = String(raw.title)
+            .replace(/\s+/g, " ")
+            .replace(/(批发|厂家|直销|包邮)/g, "")
+            .trim();
+        }
+
+        const result = toTmapiItemDetail(raw);
+        if (result.code === 200 && lang === "en" && result.data) {
+          await translateItemDetailData(result.data);
+        }
+
+        const durationSeconds = Number(
+          ((Date.now() - startedAt) / 1000).toFixed(2)
+        );
+        console.error(
+          `[timing] item_detail ${offerId} (${lang}) ${durationSeconds}s`
+        );
+        return result;
+      } catch (err) {
+        lastError = err;
+      } finally {
+        await context.close().catch(() => {});
+      }
     }
+    return tmapiError(500, lastError?.message || "Scrape failed");
   } finally {
     if (headed) await browser.close().catch(() => {});
     else releaseBrowser(browser);
+  }
+}
+
+/**
+ * Prefer HTML-embedded context (fast). Optionally wait for window.context hydrate.
+ */
+async function scrapeOfferFast(page, offerId, url, { allowHydrate = false } = {}) {
+  /** @type {any} */
+  let fromHtml = null;
+  let htmlBytes = 0;
+
+  const onResponse = async (res) => {
+    try {
+      if (res.request().resourceType() !== "document") return;
+      if (!res.url().includes(`/offer/${offerId}`)) return;
+      const html = await res.text();
+      htmlBytes = html.length;
+      const ctx = parseOfferContextFromHtml(html);
+      if (ctx) {
+        const raw = contextToRawOffer(offerId, ctx);
+        if (isUsableRawOffer(raw)) fromHtml = raw;
+      }
+    } catch {
+      // ignore — fall back below
+    }
+  };
+
+  page.on("response", onResponse);
+  try {
+    await page.goto(url, {
+      waitUntil: allowHydrate ? "domcontentloaded" : "commit",
+      timeout: 45_000,
+    });
+
+    const deadline = Date.now() + (allowHydrate ? 12_000 : 8_000);
+    while (!fromHtml && Date.now() < deadline) {
+      await sleep(30);
+      if (allowHydrate && !fromHtml) {
+        const ready = await page
+          .evaluate(() => {
+            const d = window.context?.result?.data;
+            return Boolean(
+              d?.mainPrice?.fields || d?.productTitle?.fields || d?.Root?.fields
+            );
+          })
+          .catch(() => false);
+        if (ready) break;
+      }
+    }
+    if (fromHtml) return fromHtml;
+
+    if (allowHydrate) {
+      await waitForOfferData(page, 15_000);
+      const raw = await extractRawOffer(page, offerId);
+      if (isUsableRawOffer(raw)) return raw;
+    }
+
+    throw new Error(`Could not find product data (htmlBytes=${htmlBytes})`);
+  } finally {
+    page.off("response", onResponse);
   }
 }
 

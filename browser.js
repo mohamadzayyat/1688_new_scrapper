@@ -180,10 +180,21 @@ export async function withBrowser(fn) {
 /**
  * Lean context: block images/fonts/media + trackers for speed.
  * Set blockAssets:false when images are required.
+ * Set documentOnly:true to abort everything except the main HTML document
+ * (item detail fast-path — data is embedded in window.context IIFE).
  */
 export async function newFastContext(browser, options = {}) {
-  const { blockAssets = true, ...rest } = options;
+  const { blockAssets = true, documentOnly = false, ...rest } = options;
   const context = await browser.newContext(rest);
+
+  if (documentOnly) {
+    await context.route("**/*", (route) => {
+      const type = route.request().resourceType();
+      if (type === "document") return route.continue();
+      return route.abort();
+    });
+    return context;
+  }
 
   if (blockAssets) {
     await context.route("**/*", (route) => {

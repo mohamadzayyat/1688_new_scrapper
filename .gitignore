@@ -1,5 +1,6 @@
 node_modules/
 output/
+.cache/
 .auth/
 *.json
 !package.json

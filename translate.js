@@ -74,3 +74,69 @@ export function normalizeLang(lang) {
   if (value === "en" || value === "english") return "en";
   return "zh";
 }
+
+/**
+ * Translate TMAPI item_detail `data` fields Chinese → English in-place.
+ * Fast alternative to waiting for 1688's on-page translator.
+ */
+export async function translateItemDetailData(data) {
+  if (!data || typeof data !== "object") return data;
+
+  const texts = [];
+  const apply = [];
+
+  const add = (value, setter) => {
+    if (value == null || value === "") return;
+    const i = texts.length;
+    texts.push(String(value));
+    apply.push((translated) => setter(translated[i]));
+  };
+
+  add(data.title, (t) => {
+    data.title = t;
+  });
+  add(data.shop_info?.shop_name, (t) => {
+    if (data.shop_info) data.shop_info.shop_name = t;
+  });
+
+  const propPairs = [];
+  for (const prop of data.product_props || []) {
+    for (const [k, v] of Object.entries(prop || {})) {
+      const idx = propPairs.length;
+      propPairs.push({ k, v });
+      add(k, (t) => {
+        propPairs[idx].k = t;
+      });
+      add(v, (t) => {
+        propPairs[idx].v = t;
+      });
+    }
+  }
+
+  for (const prop of data.sku_props || []) {
+    add(prop.prop_name, (t) => {
+      prop.prop_name = t;
+    });
+    for (const val of prop.values || []) {
+      add(val.name, (t) => {
+        val.name = t;
+      });
+    }
+  }
+
+  for (const sku of data.skus || []) {
+    add(sku.props_names, (t) => {
+      sku.props_names = String(t || "").replace(/\s*;\s*/g, ";");
+    });
+  }
+
+  if (!texts.length) return data;
+  const translated = await translateTexts(texts);
+  for (const fn of apply) fn(translated);
+
+  if (propPairs.length) {
+    data.product_props = propPairs.map(({ k, v }) => ({ [k]: v }));
+  }
+
+  return data;
+}
