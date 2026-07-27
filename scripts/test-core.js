@@ -3,6 +3,7 @@ import { cacheKey } from "../cache.js";
 import {
   extractJsObject,
   isUsableRawOffer,
+  parseMobileOfferInitFromHtml,
 } from "../offerContext.js";
 import { offerUrlMatches } from "../scrape.js";
 import { toTmapiItemDetail } from "../tmapiFormat.js";
@@ -17,6 +18,54 @@ const parsed = extractJsObject(
 );
 assert.equal(parsed.result.data.title, "safe } value");
 assert.equal(parsed.result.data.trailing, true);
+
+const numericSkuKeys = extractJsObject(
+  `prefix {
+    skuWeight: {
+      /* A real 1688 key; fake comment syntax must remain inert: }, 999: { */
+      6125111435364: 0.07,
+      // Another key after a line comment containing }, 888: {
+      6256859810061: 0.08,
+      "5710481973202": 0.25,
+    },
+    literal: "keep {6125111435364: 0.07}, // exactly",
+    singleQuoted: 'keep , 6256859810061: 0.08 and } exactly',
+    values: [1, 2, 3],
+  } suffix`,
+  7
+);
+assert.deepEqual(Object.keys(numericSkuKeys.skuWeight), [
+  "6125111435364",
+  "6256859810061",
+  "5710481973202",
+]);
+assert.equal(numericSkuKeys.skuWeight["6125111435364"], 0.07);
+assert.equal(numericSkuKeys.skuWeight["6256859810061"], 0.08);
+assert.equal(numericSkuKeys.skuWeight["5710481973202"], 0.25);
+assert.equal(
+  numericSkuKeys.literal,
+  "keep {6125111435364: 0.07}, // exactly"
+);
+assert.equal(
+  numericSkuKeys.singleQuoted,
+  "keep , 6256859810061: 0.08 and } exactly"
+);
+assert.deepEqual(numericSkuKeys.values, [1, 2, 3]);
+
+const mobileInit = parseMobileOfferInitFromHtml(
+  `${" ".repeat(1_000)}<script>window.__INIT_DATA={` +
+    `data:{hero:{data:{offerImgList:['https://example.test/item.jpg']}}},` +
+    `globalData:{tempModel:{offerId:'874039857500'},` +
+    `orderParamModel:{orderParam:{canBookedAmount:175}}}};</script>`
+);
+assert.equal(mobileInit.globalData.tempModel.offerId, "874039857500");
+assert.equal(
+  mobileInit.globalData.orderParamModel.orderParam.canBookedAmount,
+  175
+);
+assert.deepEqual(mobileInit.data.hero.data.offerImgList, [
+  "https://example.test/item.jpg",
+]);
 
 delete globalThis.__offerParserExecuted;
 const malicious = extractJsObject(

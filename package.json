@@ -7,7 +7,7 @@
     "1688-scrape": "./cli.js"
   },
   "scripts": {
-    "test": "npm run build && npm run test:core && npm run test:pool && npm run test:queue && npm run test:cache && npm run test:cache:disk && npm run test:translate && npm run test:category && npm run test:compat:local && npm run test:ab:mock",
+    "test": "npm run build && npm run test:core && npm run test:mtop && npm run test:pool && npm run test:queue && npm run test:cache && npm run test:cache:disk && npm run test:translate && npm run test:category && npm run test:compat:local && npm run test:ab:mock",
     "build": "node -e \"console.log('No compile step — plain Node ESM app')\"",
     "start": "node server.js",
     "scrape": "node cli.js",
@@ -22,6 +22,7 @@
     "test:cache:disk": "node scripts/test-cache-disk.js",
     "test:category": "node scripts/test-category-merge.js",
     "test:core": "node scripts/test-core.js",
+    "test:mtop": "node scripts/test-mtop-detail.js",
     "test:pool": "node scripts/test-browser-pool.js",
     "test:queue": "node scripts/test-job-queue.js",
     "test:translate": "node scripts/test-translate.js",

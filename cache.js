@@ -25,7 +25,7 @@ const DISK_DIR =
   process.env.CACHE_DIR ||
   join(fileURLToPath(new URL(".", import.meta.url)), ".cache");
 const DISK_ENABLED = String(process.env.DISK_CACHE || "1") !== "0";
-const CACHE_VERSION = process.env.CACHE_VERSION || "v4";
+const CACHE_VERSION = process.env.CACHE_VERSION || "v5";
 const DISK_MAX_FILES = Math.max(
   100,
   Number(process.env.DISK_CACHE_MAX_FILES) || 5_000

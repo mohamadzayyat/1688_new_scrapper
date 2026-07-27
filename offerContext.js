@@ -9,6 +9,117 @@ const MAX_CONTEXT_BYTES = Math.max(
   Number(process.env.MAX_CONTEXT_BYTES) || 12_000_000
 );
 
+function skipJsTrivia(source, start) {
+  let i = start;
+  while (i < source.length) {
+    if (/\s/.test(source[i])) {
+      i++;
+      continue;
+    }
+    if (source[i] === "/" && source[i + 1] === "/") {
+      i += 2;
+      while (i < source.length && source[i] !== "\n" && source[i] !== "\r") i++;
+      continue;
+    }
+    if (source[i] === "/" && source[i + 1] === "*") {
+      const end = source.indexOf("*/", i + 2);
+      if (end < 0) return source.length;
+      i = end + 2;
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
+/**
+ * JSON5 intentionally accepts JavaScript-style object literals, but its
+ * property-name grammar does not accept the unquoted numeric SKU IDs that
+ * 1688 emits (for example `{5710481973202: 0.25}`). Quote only digit-only
+ * property keys, while leaving strings and comments byte-for-byte unchanged.
+ */
+function quoteNumericObjectKeys(source) {
+  let out = "";
+  let i = 0;
+  let inString = false;
+  let stringQuote = "";
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+
+  while (i < source.length) {
+    const ch = source[i];
+    const next = source[i + 1];
+
+    if (lineComment) {
+      out += ch;
+      i++;
+      if (ch === "\n" || ch === "\r") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      out += ch;
+      i++;
+      if (ch === "*" && next === "/") {
+        out += next;
+        i++;
+        blockComment = false;
+      }
+      continue;
+    }
+    if (inString) {
+      out += ch;
+      i++;
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === stringQuote) {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"' || ch === "'" || ch === "`") {
+      inString = true;
+      stringQuote = ch;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      lineComment = true;
+      out += "//";
+      i += 2;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      blockComment = true;
+      out += "/*";
+      i += 2;
+      continue;
+    }
+
+    out += ch;
+    i++;
+    if (ch !== "{" && ch !== ",") continue;
+
+    const keyStart = skipJsTrivia(source, i);
+    let keyEnd = keyStart;
+    while (keyEnd < source.length && /[0-9]/.test(source[keyEnd])) keyEnd++;
+    if (keyEnd === keyStart) continue;
+
+    const colon = skipJsTrivia(source, keyEnd);
+    if (source[colon] !== ":") continue;
+
+    out += source.slice(i, keyStart);
+    out += `"${source.slice(keyStart, keyEnd)}"`;
+    i = keyEnd;
+  }
+
+  return out;
+}
+
 /**
  * Extract a JS object literal starting at `startIdx` (first non-space should be `{`).
  * Handles quoted strings so braces inside strings don't break matching.
@@ -22,9 +133,23 @@ export function extractJsObject(html, startIdx) {
   let inStr = false;
   let strQ = "";
   let esc = false;
+  let lineComment = false;
+  let blockComment = false;
 
   for (let j = i; j < html.length; j++) {
     const ch = html[j];
+    const next = html[j + 1];
+    if (lineComment) {
+      if (ch === "\n" || ch === "\r") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (ch === "*" && next === "/") {
+        blockComment = false;
+        j++;
+      }
+      continue;
+    }
     if (inStr) {
       if (esc) {
         esc = false;
@@ -37,9 +162,19 @@ export function extractJsObject(html, startIdx) {
       if (ch === strQ) inStr = false;
       continue;
     }
-    if (ch === '"' || ch === "'") {
+    if (ch === '"' || ch === "'" || ch === "`") {
       inStr = true;
       strQ = ch;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      lineComment = true;
+      j++;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      blockComment = true;
+      j++;
       continue;
     }
     if (ch === "{") depth++;
@@ -52,7 +187,7 @@ export function extractJsObject(html, startIdx) {
           // 1688 currently emits a JavaScript object literal rather than strict
           // JSON. JSON5 accepts its quoted/unquoted keys and trailing commas
           // without executing page-controlled source in the Node process.
-          return JSON5.parse(raw);
+          return JSON5.parse(quoteNumericObjectKeys(raw));
         } catch {
           return null;
         }
@@ -87,6 +222,22 @@ export function parseOfferContextFromHtml(html) {
     if (obj?.result?.data) return obj;
   }
   return null;
+}
+
+/**
+ * Parse the server-rendered mobile offer bootstrap. Unlike `window.context`,
+ * this payload is available on m.1688.com without an account session and
+ * carries accurate order totals, images, seller metadata and page modules.
+ */
+export function parseMobileOfferInitFromHtml(html) {
+  if (!html || html.length < 1_000) return null;
+  const idx = html.search(/window\.__INIT_DATA\s*=/);
+  if (idx < 0) return null;
+  const assignment = html.indexOf("=", idx);
+  if (assignment < 0 || assignment - idx > 64) return null;
+  const init = extractJsObject(html, assignment + 1);
+  if (!init?.globalData || !init?.data) return null;
+  return init;
 }
 
 /**

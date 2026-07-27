@@ -36,6 +36,7 @@ import {
   closeBrowserPool,
 } from "./browser.js";
 import { assertAuthLooksValid } from "./auth.js";
+import { proxyStatus } from "./proxy.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const PUBLIC_DIR = join(__dirname, "public");
@@ -1036,13 +1037,15 @@ const ROUTES = [
 
 async function handleHealth(req, res) {
   const auth = await assertAuthLooksValid();
+  const proxy = proxyStatus();
+  const upstreamReady = auth.ok || proxy.enabled;
   const browsers = browserPoolStats();
   const requiredBrowsers = 1;
   if (browsers.live < requiredBrowsers && !browsers.closing && !browsers.closed) {
     void warmBrowserPool().catch(() => {});
   }
   const ready =
-    auth.ok &&
+    upstreamReady &&
     !browsers.closing &&
     !browsers.closed &&
     browsers.live >= requiredBrowsers;
@@ -1059,6 +1062,18 @@ async function handleHealth(req, res) {
   sendJson(res, 200, {
     ...summary,
     auth,
+    upstream: {
+      ready: upstreamReady,
+      mode:
+        auth.ok && proxy.enabled
+          ? "auth+proxy"
+          : auth.ok
+            ? "auth"
+            : proxy.enabled
+              ? "proxy"
+              : "none",
+      proxy,
+    },
     security: { apiTokenRequired: Boolean(SCRAPER_API_TOKEN) },
     uptimeSec: Math.round(process.uptime()),
     queue: jobQueueStats(),
@@ -1070,13 +1085,14 @@ async function handleHealth(req, res) {
 
 async function handleReady(_req, res) {
   const auth = await assertAuthLooksValid();
+  const proxy = proxyStatus();
   const browsers = browserPoolStats();
   const requiredBrowsers = 1;
   if (browsers.live < requiredBrowsers && !browsers.closing && !browsers.closed) {
     void warmBrowserPool().catch(() => {});
   }
   const ready =
-    auth.ok &&
+    (auth.ok || proxy.enabled) &&
     !browsers.closing &&
     !browsers.closed &&
     browsers.live >= requiredBrowsers;

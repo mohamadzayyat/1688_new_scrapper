@@ -7,6 +7,7 @@ import { launchBrowser, acquirePooledBrowser, releaseBrowser, newFastContext } f
 import { getPlaywrightProxy } from "./proxy.js";
 import { currentJobSignal, jobAbortError } from "./jobContext.js";
 import { toTmapiItemDetail, tmapiError } from "./tmapiFormat.js";
+import { scrapeOfferMtop } from "./mtopDetail.js";
 import { AUTH_PATH, hasSavedAuth } from "./auth.js";
 import {
   parseOfferContextFromHtml,
@@ -299,6 +300,12 @@ function normalizeLang(lang) {
   return "zh";
 }
 
+export function detailHttpAttemptOrder(hasSavedSession) {
+  return hasSavedSession
+    ? ["desktop-http", "mobile-mtop"]
+    : ["mobile-mtop", "desktop-http"];
+}
+
 function normalizeProduct(offerId, pageUrl, extracted, lang = "zh") {
   const title = extracted.productTitle || {};
   const mainPrice = extracted.mainPrice || {};
@@ -572,7 +579,7 @@ export async function getItemDetailById(
   }
 
   const url = `https://detail.1688.com/offer/${offerId}.html`;
-  const finish = async (raw, path) => {
+  const finish = async (raw, path, timingPath = path) => {
     if (optimize_title && raw.title) {
       raw.title = String(raw.title)
         .replace(/\s+/g, " ")
@@ -590,6 +597,14 @@ export async function getItemDetailById(
         });
       }
     }
+    if (currentJobSignal()?.aborted) {
+      throw jobAbortError(currentJobSignal());
+    }
+    if (Date.now() > deadline) {
+      const error = new Error("Item scrape deadline exceeded");
+      error.code = 504;
+      throw error;
+    }
     Object.defineProperty(result, "__scraperPath", {
       value: path,
       enumerable: false,
@@ -599,24 +614,41 @@ export async function getItemDetailById(
       ((Date.now() - startedAt) / 1000).toFixed(2)
     );
     console.error(
-      `[timing] item_detail ${offerId} (${lang}) ${durationSeconds}s path=${path}`
+      `[timing] item_detail ${offerId} (${lang}) ${durationSeconds}s path=${timingPath}`
     );
     return result;
   };
 
   let lastError;
+  let savedAuth = false;
   if (!headed) {
-    try {
-      const raw = await scrapeOfferHttp(offerId, url, deadline);
-      return await finish(raw, "http");
-    } catch (err) {
-      lastError = err;
-      if (err?.fastFail || (err?.directBlocked && !(await hasSavedAuth()))) {
-        return tmapiError(500, err.message || "Direct product request failed");
+    savedAuth = await hasSavedAuth();
+    for (const path of detailHttpAttemptOrder(savedAuth)) {
+      if (Date.now() >= deadline) break;
+      try {
+        if (path === "desktop-http") {
+          const raw = await scrapeOfferHttp(offerId, url, deadline);
+          return await finish(raw, "http");
+        }
+
+        // The anonymous mobile page has accurate order totals/images while
+        // the signed MTop response supplies the complete SKU matrix.
+        const raw = await scrapeOfferMtop(offerId, { deadline });
+        // Keep the public compatibility header as `http`; timing logs retain
+        // the precise source so operators can compare paths independently.
+        return await finish(raw, "http", "mobile-mtop");
+      } catch (err) {
+        if (currentJobSignal()?.aborted || err?.cancelled || err?.code === 499) {
+          throw jobAbortError(currentJobSignal());
+        }
+        lastError = err;
       }
     }
   }
 
+  if (Date.now() >= deadline) {
+    return tmapiError(500, lastError?.message || "Item scrape deadline exceeded");
+  }
   const browser = headed
     ? await launchBrowser({ headed: true })
     : await acquirePooledBrowser();
@@ -633,7 +665,7 @@ export async function getItemDetailById(
     for (let attempt = 1; attempt <= 2; attempt++) {
       if (Date.now() >= deadline) break;
       const contextOpts = buildContextOpts();
-      if (!headed && (await hasSavedAuth())) {
+      if (!headed && savedAuth) {
         contextOpts.storageState = AUTH_PATH;
       }
 
@@ -667,6 +699,9 @@ export async function getItemDetailById(
         }
         return await finish(raw, "browser");
       } catch (err) {
+        if (currentJobSignal()?.aborted || err?.cancelled || err?.code === 499) {
+          throw jobAbortError(currentJobSignal());
+        }
         lastError = err;
         if (/login session|required login|login wall/i.test(err?.message || "")) {
           break;
