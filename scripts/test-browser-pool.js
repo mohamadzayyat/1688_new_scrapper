@@ -121,6 +121,28 @@ async function testDisconnectReplacesForWaiter() {
   await pool.close();
 }
 
+async function testCancelledWaiterIsRemoved() {
+  const factory = fakeFactory();
+  const pool = new BrowserPool(1, {
+    warmSize: 1,
+    acquireTimeoutMs: 500,
+    createBrowser: () => factory.create(),
+  });
+  const leased = await pool.acquire();
+  const controller = new AbortController();
+  const waiting = pool.acquire({ signal: controller.signal });
+  await delay(10);
+  assert.equal(pool.snapshot().waiting, 1);
+  controller.abort();
+  await assert.rejects(
+    waiting,
+    (error) => error.code === 499 && error.cancelled === true
+  );
+  assert.equal(pool.snapshot().waiting, 0);
+  pool.release(leased);
+  await pool.close();
+}
+
 async function testCapacityNeverExceeded() {
   const factory = fakeFactory({ launchDelayMs: 10 });
   const pool = new BrowserPool(2, {
@@ -174,6 +196,7 @@ const tests = [
   testSharedWarmPromise,
   testWarmFailureCanRetry,
   testAcquireTimeout,
+  testCancelledWaiterIsRemoved,
   testDisconnectReplacesForWaiter,
   testCapacityNeverExceeded,
   testCloseRejectsWaitersAndIsIdempotent,

@@ -138,9 +138,29 @@ export function contextToRawOffer(offerId, ctx) {
 
 export function isUsableRawOffer(raw) {
   const images = raw?.images || raw?.galleryImgs || [];
+  const trade = raw?.mainPrice?.finalPriceModel?.tradeWithoutPromotion || {};
+  const tierPrices = [
+    ...(raw?.mainPrice?.originalPricesWithoutPromotion || []),
+    ...(raw?.mainPrice?.priceModel?.currentPrices || []),
+    ...(raw?.orderParam?.skuParam?.skuRangePrices || []),
+  ];
+  const skuRows = Object.values(
+    raw?.skuModel?.skuInfoMap || raw?.skuModel?.skuInfoMapOriginal || {}
+  );
+  const hasPositivePrice = [
+    trade.offerMinPrice,
+    trade.offerMaxPrice,
+    raw?.skuModel?.skuPriceScale,
+    raw?.skuModel?.skuPriceScaleOriginal,
+    ...tierPrices.map((row) => row?.price),
+    ...skuRows.flatMap((row) => [row?.discountPrice, row?.price]),
+  ].some((value) => {
+    const match = String(value ?? "").replace(/,/g, "").match(/\d+(?:\.\d+)?/);
+    return match ? Number(match[0]) > 0 : false;
+  });
   return Boolean(
     raw?.title &&
-      (raw.mainPrice || raw.skuModel) &&
+      hasPositivePrice &&
       Array.isArray(images) &&
       images.length > 0
   );

@@ -4,6 +4,7 @@ import {
   extractJsObject,
   isUsableRawOffer,
 } from "../offerContext.js";
+import { offerUrlMatches } from "../scrape.js";
 import { toTmapiItemDetail } from "../tmapiFormat.js";
 import {
   convertImageUrl,
@@ -74,6 +75,26 @@ const rawOffer = {
 };
 
 assert.equal(isUsableRawOffer(rawOffer), true);
+assert.equal(
+  offerUrlMatches("https://detail.1688.com/offer/874039857500.html?spm=test", "874039857500"),
+  true
+);
+assert.equal(
+  offerUrlMatches("https://detail.1688.com/offer/8740398575000.html", "874039857500"),
+  false
+);
+assert.equal(
+  offerUrlMatches("https://example.com/offer/874039857500.html", "874039857500"),
+  false
+);
+assert.equal(
+  isUsableRawOffer({
+    title: "Sparse product",
+    images: ["https://cbu01.alicdn.com/img/sparse.jpg"],
+    mainPrice: {},
+  }),
+  false
+);
 const detail = toTmapiItemDetail(rawOffer);
 assert.equal(detail.code, 200);
 assert.equal(detail.data.item_id, 874039857500);

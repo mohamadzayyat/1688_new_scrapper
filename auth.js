@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { launchBrowser } from "./browser.js";
+import { bindContextToJob } from "./jobContext.js";
 
 const ROOT = fileURLToPath(new URL(".", import.meta.url));
 export const AUTH_PATH = resolve(ROOT, ".auth", "1688.json");
@@ -168,6 +169,7 @@ export async function newAuthedContext(browser, options = {}) {
     : await browser.newContext(base);
 
   try {
+    await bindContextToJob(context);
     if (blockAssets) {
       await context.route("**/*", (route) => {
         const request = route.request();

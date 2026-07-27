@@ -4,6 +4,12 @@
  */
 import { chromium } from "playwright";
 import { getPlaywrightProxy, proxyStatus } from "./proxy.js";
+import {
+  bindContextToJob,
+  currentJobSignal,
+  jobAbortError,
+  throwIfJobAborted,
+} from "./jobContext.js";
 
 function envInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
   const raw = process.env[name];
@@ -112,13 +118,15 @@ class BrowserPool {
     return err;
   }
 
-  async _waitUntil(promise, deadline) {
+  async _waitUntil(promise, deadline, signal = null) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw this._acquireTimeoutError();
+    if (signal?.aborted) throw jobAbortError(signal);
 
     let timer;
+    let onAbort;
     try {
-      return await Promise.race([
+      const waits = [
         promise,
         new Promise((_, reject) => {
           timer = setTimeout(
@@ -126,9 +134,19 @@ class BrowserPool {
             remaining
           );
         }),
-      ]);
+      ];
+      if (signal) {
+        waits.push(
+          new Promise((_, reject) => {
+            onAbort = () => reject(jobAbortError(signal));
+            signal.addEventListener("abort", onAbort, { once: true });
+          })
+        );
+      }
+      return await Promise.race(waits);
     } finally {
       clearTimeout(timer);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
     }
   }
 
@@ -217,7 +235,15 @@ class BrowserPool {
     if (idx < 0) return;
     this.browsers.splice(idx, 1);
     this.stats.disconnects += 1;
-    if (!this.closing && !this.closed) this._dispatchWaiters();
+    if (!this.closing && !this.closed) {
+      this.warmPromise = null;
+      this._dispatchWaiters();
+      if (this.browsers.length + this.creating < this.warmSize) {
+        void this.ensureWarm().catch((error) => {
+          console.error(`[pool] replacement warm failed: ${error?.message || error}`);
+        });
+      }
+    }
   }
 
   _nextWaiter() {
@@ -232,6 +258,10 @@ class BrowserPool {
     if (!waiter || waiter.settled) return false;
     waiter.settled = true;
     clearTimeout(waiter.timer);
+    if (waiter.onAbort) {
+      waiter.signal?.removeEventListener("abort", waiter.onAbort);
+      waiter.onAbort = null;
+    }
     if (error) waiter.reject(error);
     else waiter.resolve(browser);
     return true;
@@ -276,13 +306,14 @@ class BrowserPool {
     }
   }
 
-  async acquire() {
+  async acquire({ signal = null } = {}) {
     this.stats.acquires += 1;
     if (this.closing || this.closed) throw this._poolClosedError();
+    if (signal?.aborted) throw jobAbortError(signal);
 
     const deadline = Date.now() + this.acquireTimeoutMs;
     try {
-      await this._waitUntil(this.ensureWarm(), deadline);
+      await this._waitUntil(this.ensureWarm(), deadline, signal);
     } catch (err) {
       if (err?.browserAcquireTimeout) this.stats.acquireTimeouts += 1;
       throw err;
@@ -292,6 +323,7 @@ class BrowserPool {
       (entry) => !entry.busy && entry.browser.isConnected()
     );
     if (free) {
+      if (signal?.aborted) throw jobAbortError(signal);
       free.busy = true;
       return free.browser;
     }
@@ -304,6 +336,8 @@ class BrowserPool {
         settled: false,
         at: Date.now(),
         timer: null,
+        signal,
+        onAbort: null,
       };
       const remaining = Math.max(0, deadline - Date.now());
       waiter.timer = setTimeout(() => {
@@ -315,6 +349,16 @@ class BrowserPool {
         this._dispatchWaiters();
       }, remaining);
       this.waitQueue.push(waiter);
+      if (signal) {
+        waiter.onAbort = () => {
+          const idx = this.waitQueue.indexOf(waiter);
+          if (idx >= 0) this.waitQueue.splice(idx, 1);
+          this._settleWaiter(waiter, { error: jobAbortError(signal) });
+          this._dispatchWaiters();
+        };
+        signal.addEventListener("abort", waiter.onAbort, { once: true });
+        if (signal.aborted) waiter.onAbort();
+      }
       this._dispatchWaiters();
     });
   }
@@ -397,7 +441,14 @@ export async function launchBrowser({ headed = false } = {}) {
  * Do NOT call browser.close() - that destroys the pool worker.
  */
 export async function acquirePooledBrowser() {
-  return pool.acquire();
+  throwIfJobAborted();
+  const signal = currentJobSignal();
+  const browser = await pool.acquire({ signal });
+  if (currentJobSignal()?.aborted) {
+    pool.release(browser);
+    throw jobAbortError(currentJobSignal());
+  }
+  return browser;
 }
 
 export function releaseBrowser(browser) {
@@ -429,34 +480,40 @@ export async function newFastContext(browser, options = {}) {
     ...rest,
   });
 
-  if (documentOnly) {
-    await context.route("**/*", (route) => {
-      const type = route.request().resourceType();
-      if (type === "document") return route.continue();
-      return route.abort();
-    });
+  try {
+    await bindContextToJob(context);
+    if (documentOnly) {
+      await context.route("**/*", (route) => {
+        const type = route.request().resourceType();
+        if (type === "document") return route.continue();
+        return route.abort();
+      });
+      return context;
+    }
+
+    if (blockAssets) {
+      await context.route("**/*", (route) => {
+        const type = route.request().resourceType();
+        if (type === "image" || type === "media" || type === "font") {
+          return route.abort();
+        }
+        const url = route.request().url();
+        if (
+          /google-analytics|googletagmanager|doubleclick|facebook\.net|hm\.baidu/i.test(
+            url
+          )
+        ) {
+          return route.abort();
+        }
+        return route.continue();
+      });
+    }
+
     return context;
+  } catch (error) {
+    await context.close().catch(() => {});
+    throw error;
   }
-
-  if (blockAssets) {
-    await context.route("**/*", (route) => {
-      const type = route.request().resourceType();
-      if (type === "image" || type === "media" || type === "font") {
-        return route.abort();
-      }
-      const url = route.request().url();
-      if (
-        /google-analytics|googletagmanager|doubleclick|facebook\.net|hm\.baidu/i.test(
-          url
-        )
-      ) {
-        return route.abort();
-      }
-      return route.continue();
-    });
-  }
-
-  return context;
 }
 
 export function browserPoolStats() {

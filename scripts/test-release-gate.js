@@ -75,6 +75,9 @@ const COLD_MAX_MS = intEnv(
   Math.max(500, TIMEOUT_MS - 1)
 );
 const PAGE_SIZE = intEnv("PAGE_SIZE", 5, 1, 20);
+const CATEGORY_PAGE_SIZE = intEnv("CATEGORY_PAGE_SIZE", 50, 1, 50);
+const REQUIRE_DETAIL_HTTP = boolEnv("REQUIRE_DETAIL_HTTP", true);
+const REQUIRE_COLD_CACHE_MISS = boolEnv("REQUIRE_COLD_CACHE_MISS", true);
 
 const FIXTURE = {
   itemId: String(ENV.ITEM_ID || "874039857500").trim(),
@@ -93,6 +96,15 @@ FIXTURE.shopUrl = String(
   ENV.SHOP_URL ||
     `https://winport.m.1688.com/page/index.html?memberId=${encodeURIComponent(FIXTURE.memberId)}`
 ).trim();
+const SEARCH_SORT = String(ENV.SEARCH_SORT || "price_up");
+const PRICE_START = String(ENV.PRICE_START || "1");
+const PRICE_END = String(ENV.PRICE_END || "500");
+const MULTI_CATEGORY_IDS = String(
+  ENV.CAT_IDS || `${FIXTURE.categoryId},71`
+)
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
 
 const TEST_PAGINATION = boolEnv("TEST_PAGINATION", true);
 const EXPECT_SECOND_PAGE = boolEnv("EXPECT_SECOND_PAGE", true);
@@ -177,6 +189,14 @@ function itemTitle(item) {
   return String(item.title || item.subject || item.product_name || "").trim();
 }
 
+function looksEnglish(value) {
+  const text = String(value || "").trim();
+  if (!/[A-Za-z]/.test(text)) return false;
+  const compact = text.replace(/\s+/g, "");
+  const han = compact.match(/[\u3400-\u4dbf\u4e00-\u9fff]/g)?.length || 0;
+  return han / Math.max(1, compact.length) <= 0.1;
+}
+
 function itemImage(item) {
   if (!isObject(item)) return "";
   const direct = item.img || item.image || item.image_url || item.img_url || item.pic_url;
@@ -254,7 +274,6 @@ function requestUrl(path, query = {}) {
       url.searchParams.set(key, String(value));
     }
   }
-  if (API_TOKEN) url.searchParams.set("apiToken", API_TOKEN);
   return url;
 }
 
@@ -268,6 +287,7 @@ async function requestJson(label, spec, phase = "cold") {
       headers: { Accept: "application/json" },
       signal: controller.signal,
     };
+    if (API_TOKEN) init.headers["X-API-Token"] = API_TOKEN;
     if (spec.body !== undefined) {
       init.headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(spec.body);
@@ -287,6 +307,8 @@ async function requestJson(label, spec, phase = "cold") {
       phase,
       status: response.status,
       contentType: response.headers.get("content-type") || "",
+      scraperCache: response.headers.get("x-scraper-cache") || "",
+      scraperPath: response.headers.get("x-scraper-path") || "",
       bytes: Buffer.byteLength(text),
       ms: performance.now() - started,
       body,
@@ -362,7 +384,7 @@ async function execute(test, spec, validator, warm) {
   const completenessBefore = completenessFailures.length;
   const result = await requestJson(test, spec, "cold");
   const envelopeOk = validateEnvelope(test, result);
-  if (envelopeOk && validator) validator(result.body.data, result.body);
+  if (envelopeOk && validator) validator(result.body.data, result.body, result);
 
   if (result && !result.error) {
     if (result.ms > COLD_MAX_MS) {
@@ -403,16 +425,28 @@ function validateCards(test, data, options = {}) {
   } else if (usable.length < rows.length) {
     completeness(test, `${rows.length - usable.length}/${rows.length} result cards are incomplete`);
   }
+  if (String(FIXTURE.language).toLowerCase() === "en" && rows.length) {
+    const english = rows.filter((row) => looksEnglish(itemTitle(row)));
+    if (english.length / rows.length < 0.8) {
+      hard(test, `only ${english.length}/${rows.length} titles are observably English`);
+    } else if (english.length < rows.length) {
+      completeness(test, `${rows.length - english.length}/${rows.length} titles retain Chinese text`);
+    }
+  }
   return rows;
 }
 
-function requirePage(test, data, page) {
+function requirePage(test, data, page, expectedPageSize) {
   if (!isObject(data)) {
     hard(test, "data is not an object");
     return;
   }
   if (finiteNumber(data.page) !== page) hard(test, `data.page does not equal requested page ${page}`);
-  if (finiteNumber(data.page_size) === null) hard(test, "data.page_size is missing or non-numeric");
+  const actualPageSize = finiteNumber(data.page_size);
+  if (actualPageSize === null) hard(test, "data.page_size is missing or non-numeric");
+  else if (expectedPageSize !== undefined && actualPageSize !== expectedPageSize) {
+    hard(test, `data.page_size=${actualPageSize}, expected ${expectedPageSize}`);
+  }
 }
 
 function requireTotal(test, data, acceptedKeys) {
@@ -467,11 +501,59 @@ function assessPageOverlap(test, firstData, secondData, keys = ["items"]) {
   const secondSet = new Set(second);
   const overlap = first.filter((id) => secondSet.has(id));
   const ratio = overlap.length / Math.min(first.length, second.length);
-  if (first.join(",") === second.join(",") || ratio >= 0.5) {
+  if (overlap.length > 0) {
     hard(test, `page 1/page 2 overlap is ${Math.round(ratio * 100)}%`);
-  } else if (overlap.length > 0) {
-    completeness(test, `${overlap.length} IDs repeat between page 1 and page 2`);
   }
+}
+
+function assessCrossPageSearch(test, firstData, secondData, sort) {
+  const firstTotal = finiteNumber(firstData?.total_count ?? firstData?.total);
+  const secondTotal = finiteNumber(secondData?.total_count ?? secondData?.total);
+  if (firstTotal !== null && secondTotal !== null && firstTotal !== secondTotal) {
+    hard(test, `page totals differ (${firstTotal} vs ${secondTotal})`);
+  }
+  if (!["price_up", "price_down"].includes(sort)) return;
+  const firstPrices = rowsFrom(firstData, ["items"])
+    ?.map(itemPrice)
+    .filter((value) => value !== null) || [];
+  const secondPrices = rowsFrom(secondData, ["items"])
+    ?.map(itemPrice)
+    .filter((value) => value !== null) || [];
+  if (!firstPrices.length || !secondPrices.length) return;
+  const boundaryOk =
+    sort === "price_up"
+      ? firstPrices[firstPrices.length - 1] <= secondPrices[0]
+      : firstPrices[firstPrices.length - 1] >= secondPrices[0];
+  if (!boundaryOk) hard(test, `${sort} ordering breaks across page 1/page 2`);
+}
+
+async function runInvalidCategoryControl(referenceData) {
+  const test = "category negative control";
+  const hardBefore = hardFailures.length;
+  const result = await requestJson(
+    test,
+    {
+      path: "/1688/category/items",
+      query: { cat_id: "999999999999", page: 1, page_size: 5 },
+    },
+    "negative"
+  );
+  if (result.error || result.status < 200 || result.status >= 300 || !isObject(result.body)) {
+    hard(test, result.error?.message || `invalid transport/HTTP ${result.status ?? "-"}`);
+  } else if (Number(result.body.code) === 200) {
+    const rows = rowsFrom(result.body.data, ["items"]) || [];
+    if (rows.length > 0) {
+      const referenceIds = new Set(idsFrom(referenceData));
+      const overlap = idsFrom(result.body.data).filter((id) => referenceIds.has(id));
+      hard(
+        test,
+        `nonexistent category returned ${rows.length} items (${overlap.length} overlap the valid category)`
+      );
+    }
+  }
+  console.log(
+    `${hardFailures.length === hardBefore ? "PASS" : "HARD"} ${test.padEnd(31)} http=${result.status ?? "-"} code=${result.body?.code ?? "-"} ${Math.round(result.ms)}ms`
+  );
 }
 
 function validateCategoryTop(test, data) {
@@ -506,10 +588,22 @@ function validateCategoryInfo(test, data) {
 }
 
 function validateCategoryItems(test, data, page) {
-  requirePage(test, data, page);
+  requirePage(test, data, page, CATEGORY_PAGE_SIZE);
   const rows = validateCards(test, data);
   const total = requireTotal(test, data, ["total"]);
   if (total !== null && total < rows.length) hard(test, "total is smaller than returned item count");
+  if (total !== null) {
+    const expectedCount = Math.min(
+      CATEGORY_PAGE_SIZE,
+      Math.max(0, total - (page - 1) * CATEGORY_PAGE_SIZE)
+    );
+    if (rows.length !== expectedCount) {
+      hard(
+        test,
+        `returned ${rows.length} category items, expected ${expectedCount} for page_size=${CATEGORY_PAGE_SIZE}`
+      );
+    }
+  }
   if (typeof data?.has_next_page !== "boolean") {
     hard(test, "has_next_page must be a boolean for TmapiService::getCategoryItems");
   }
@@ -517,7 +611,13 @@ function validateCategoryItems(test, data, page) {
   if (withPath.length === 0) {
     completeness(test, "no category item exposes category_path, so category membership cannot be verified");
   } else {
-    const matches = withPath.filter((item) => item.category_path.some((id) => sameId(id, FIXTURE.categoryId)));
+    const categoryNodeId = (node) =>
+      isObject(node)
+        ? node.id ?? node.cat_id ?? node.category_id ?? node.cid
+        : node;
+    const matches = withPath.filter((item) =>
+      item.category_path.some((node) => sameId(categoryNodeId(node), FIXTURE.categoryId))
+    );
     if (matches.length === 0) hard(test, "none of the category results belongs to the requested category path");
     else if (matches.length / withPath.length < 0.8) {
       completeness(test, `only ${matches.length}/${withPath.length} category paths include the requested category`);
@@ -590,6 +690,13 @@ function validateItemDetail(test, data, { full = true } = {}) {
   }
   if (!sameId(data.item_id, FIXTURE.itemId)) hard(test, "returned item_id does not match fixture");
   if (!nonBlank(data.title)) hard(test, "title is missing");
+  if (
+    String(FIXTURE.language).toLowerCase() === "en" &&
+    nonBlank(data.title) &&
+    !looksEnglish(data.title)
+  ) {
+    hard(test, "English item-detail title is still predominantly Chinese");
+  }
   if (!Array.isArray(data.main_imgs) || !data.main_imgs.some(validHttpImage)) {
     hard(test, "main_imgs has no usable HTTP image");
   }
@@ -717,17 +824,50 @@ function validateShopItems(test, data, page) {
   );
 }
 
-function validateTextSearch(test, data, page) {
-  requirePage(test, data, page);
+function validateSearchPage(
+  test,
+  data,
+  page,
+  expectedPageSize,
+  sort,
+  minPrice,
+  maxPrice
+) {
+  requirePage(test, data, page, expectedPageSize);
   const rows = validateCards(test, data);
   const total = requireTotal(test, data, ["total_count"]);
   if (total !== null && total < rows.length) hard(test, "search total_count is smaller than returned item count");
+  if (total !== null) {
+    const expectedCount = Math.min(
+      expectedPageSize,
+      Math.max(0, total - (page - 1) * expectedPageSize)
+    );
+    if (rows.length !== expectedCount) {
+      hard(
+        test,
+        `returned ${rows.length} search items, expected ${expectedCount} for page_size=${expectedPageSize}`
+      );
+    }
+  }
   validateSortAndPrices(
     test,
     rows,
-    String(ENV.SEARCH_SORT || "default"),
-    optionalEnv("PRICE_START"),
-    optionalEnv("PRICE_END")
+    sort,
+    minPrice,
+    maxPrice
+  );
+  return rows;
+}
+
+function validateTextSearch(test, data, page, expectedPageSize = PAGE_SIZE) {
+  const rows = validateSearchPage(
+    test,
+    data,
+    page,
+    expectedPageSize,
+    SEARCH_SORT,
+    PRICE_START,
+    PRICE_END
   );
   const tokens = FIXTURE.keyword.toLowerCase().split(/\s+/).filter((token) => token.length >= 3);
   if (tokens.length) {
@@ -814,6 +954,20 @@ async function runWarmGate() {
       if (entry.quickValidate && !entry.quickValidate(result.body.data)) {
         hard(label, "warm response lost its consumer-usable shape");
       }
+      if (key === "item_detail") {
+        if (result.scraperCache !== "memory") {
+          hard(
+            label,
+            `warm detail cache marker is ${result.scraperCache || "missing"}, expected memory`
+          );
+        }
+        if (REQUIRE_DETAIL_HTTP && result.scraperPath !== "http") {
+          hard(
+            label,
+            `warm detail path is ${result.scraperPath || "missing"}, expected http`
+          );
+        }
+      }
       if (entry.signature) {
         const signature = entry.signature(result.body.data);
         if (entry.initialSignature && signature && signature !== entry.initialSignature) {
@@ -870,7 +1024,7 @@ async function main() {
 
   const categorySpec = (page) => ({
     path: "/1688/category/items",
-    query: { cat_id: FIXTURE.categoryId, page, page_size: PAGE_SIZE },
+    query: { cat_id: FIXTURE.categoryId, page, page_size: CATEGORY_PAGE_SIZE },
   });
   const categoryPage1 = await execute(
     "category items p1",
@@ -892,15 +1046,33 @@ async function main() {
       assessPageOverlap("category pagination", categoryPage1.body.data, categoryPage2.body.data);
     }
   }
+  if (categoryPage1) await runInvalidCategoryControl(categoryPage1.body.data);
 
   const detailSpec = {
     path: "/1688/item_detail",
-    query: { item_id: FIXTURE.itemId, language: FIXTURE.language },
+    query: {
+      item_id: FIXTURE.itemId,
+      language: FIXTURE.language,
+    },
   };
   await execute(
     "item detail",
     detailSpec,
-    (data) => validateItemDetail("item detail", data),
+    (data, _body, result) => {
+      validateItemDetail("item detail", data);
+      if (REQUIRE_COLD_CACHE_MISS && result.scraperCache !== "miss") {
+        hard(
+          "item detail",
+          `cold detail cache marker is ${result.scraperCache || "missing"}, expected miss`
+        );
+      }
+      if (REQUIRE_DETAIL_HTTP && result.scraperPath !== "http") {
+        hard(
+          "item detail",
+          `detail path is ${result.scraperPath || "missing"}, expected http`
+        );
+      }
+    },
     {
       key: "item_detail",
       quickValidate: (data) =>
@@ -912,7 +1084,10 @@ async function main() {
     "global item detail",
     {
       path: "/1688/global/item_detail",
-      query: { item_id: FIXTURE.itemId, language: FIXTURE.language },
+      query: {
+        item_id: FIXTURE.itemId,
+        language: FIXTURE.language,
+      },
     },
     (data) => validateItemDetail("global item detail", data, { full: false })
   );
@@ -1066,12 +1241,11 @@ async function main() {
         page,
         page_size: PAGE_SIZE,
         language: FIXTURE.language,
-        sort: String(ENV.SEARCH_SORT || "default"),
+        sort: SEARCH_SORT,
       },
       {
-        price_start: optionalEnv("PRICE_START"),
-        price_end: optionalEnv("PRICE_END"),
-        cat_ids: optionalEnv("CAT_IDS"),
+        price_start: PRICE_START,
+        price_end: PRICE_END,
       }
     );
   const searchSpec = (page) => ({ path: "/1688/global/search/items", query: searchQuery(page) });
@@ -1093,6 +1267,254 @@ async function main() {
     );
     if (searchPage1 && searchPage2) {
       assessPageOverlap("text-search pagination", searchPage1.body.data, searchPage2.body.data);
+      assessCrossPageSearch(
+        "text-search pagination",
+        searchPage1.body.data,
+        searchPage2.body.data,
+        SEARCH_SORT
+      );
+
+      const widePageSize = Math.min(20, PAGE_SIZE * 2);
+      if (widePageSize === PAGE_SIZE * 2) {
+        const wideQuery = { ...searchQuery(1), page_size: widePageSize };
+        const wide = await execute(
+          "text-search continuity",
+          { path: "/1688/global/search/items", query: wideQuery },
+          (data) =>
+            validateTextSearch(
+              "text-search continuity",
+              data,
+              1,
+              widePageSize
+            )
+        );
+        if (wide) {
+          const splitIds = [
+            ...idsFrom(searchPage1.body.data),
+            ...idsFrom(searchPage2.body.data),
+          ];
+          const wideIds = idsFrom(wide.body.data);
+          if (wideIds.join(",") !== splitIds.join(",")) {
+            hard(
+              "text-search continuity",
+              `page1(size=${widePageSize}) does not equal page1+page2(size=${PAGE_SIZE})`
+            );
+          }
+        }
+      }
+    }
+  }
+
+  const filterControlSize = Math.min(20, Math.max(10, PAGE_SIZE * 2));
+  const unfilteredControl = await execute(
+    "search filter baseline",
+    {
+      path: "/1688/global/search/items",
+      query: {
+        keyword: FIXTURE.keyword,
+        page: 1,
+        page_size: filterControlSize,
+        language: FIXTURE.language,
+        sort: "price_up",
+      },
+    },
+    (data) =>
+      validateSearchPage(
+        "search filter baseline",
+        data,
+        1,
+        filterControlSize,
+        "price_up"
+      )
+  );
+  if (unfilteredControl) {
+    const baselineRows = rowsFrom(unfilteredControl.body.data, ["items"]) || [];
+    const distinctPrices = [...new Set(baselineRows.map(itemPrice).filter((p) => p !== null))]
+      .sort((left, right) => left - right);
+    const dynamicFloor = distinctPrices[Math.floor(distinctPrices.length / 2)];
+    if (distinctPrices.length < 2 || dynamicFloor <= distinctPrices[0]) {
+      hard(
+        "search price filters",
+        "fixture does not expose at least two distinct prices, so filter enforcement cannot be proven"
+      );
+    } else {
+      const filteredQuery = {
+        keyword: FIXTURE.keyword,
+        page: 1,
+        page_size: filterControlSize,
+        language: FIXTURE.language,
+        price_start: String(dynamicFloor),
+      };
+      const filteredAscending = await execute(
+        "search price filter",
+        {
+          path: "/1688/global/search/items",
+          query: { ...filteredQuery, sort: "price_up" },
+        },
+        (data) =>
+          validateSearchPage(
+            "search price filter",
+            data,
+            1,
+            filterControlSize,
+            "price_up",
+            String(dynamicFloor)
+          )
+      );
+      await execute(
+        "search price descending",
+        {
+          path: "/1688/global/search/items",
+          query: { ...filteredQuery, sort: "price_down" },
+        },
+        (data) =>
+          validateSearchPage(
+            "search price descending",
+            data,
+            1,
+            filterControlSize,
+            "price_down",
+            String(dynamicFloor)
+          )
+      );
+      if (filteredAscending) {
+        const baselineTotal = finiteNumber(
+          unfilteredControl.body.data?.total_count ?? unfilteredControl.body.data?.total
+        );
+        const filteredTotal = finiteNumber(
+          filteredAscending.body.data?.total_count ?? filteredAscending.body.data?.total
+        );
+        const baselineIds = new Set(idsFrom(unfilteredControl.body.data));
+        const pulledFromLaterPages = idsFrom(filteredAscending.body.data).some(
+          (id) => !baselineIds.has(id)
+        );
+        if (
+          !(baselineTotal !== null && filteredTotal !== null && filteredTotal < baselineTotal) &&
+          !pulledFromLaterPages
+        ) {
+          hard(
+            "search price filters",
+            "price_start neither reduced the upstream total nor replenished results from later pages"
+          );
+        }
+      }
+    }
+  }
+
+  if (MULTI_CATEGORY_IDS.length < 2) {
+    hard("multi-category search", "CAT_IDS must contain at least two category IDs");
+  } else {
+    const multiQuery = (catIds, page = 1) => ({
+      keyword: FIXTURE.keyword,
+      page,
+      page_size: PAGE_SIZE,
+      language: FIXTURE.language,
+      sort: "default",
+      cat_ids: catIds.join(","),
+    });
+    const multiForward = await execute(
+      "multi-category search",
+      { path: "/1688/global/search/items", query: multiQuery(MULTI_CATEGORY_IDS) },
+      (data) =>
+        validateSearchPage(
+          "multi-category search",
+          data,
+          1,
+          PAGE_SIZE,
+          "default"
+        )
+    );
+    const multiReverse = await execute(
+      "multi-category reverse",
+      {
+        path: "/1688/global/search/items",
+        query: multiQuery([...MULTI_CATEGORY_IDS].reverse()),
+      },
+      (data) =>
+        validateSearchPage(
+          "multi-category reverse",
+          data,
+          1,
+          PAGE_SIZE,
+          "default"
+        )
+    );
+    if (multiForward && multiReverse) {
+      const forwardIds = idsFrom(multiForward.body.data);
+      const reverseIds = idsFrom(multiReverse.body.data);
+      if (forwardIds.join(",") !== reverseIds.join(",")) {
+        hard(
+          "multi-category search",
+          "category order changed the ordered result set"
+        );
+      }
+      if (multiReverse.scraperCache !== "memory") {
+        hard(
+          "multi-category reverse",
+          `canonical reverse lookup was ${multiReverse.scraperCache || "unmarked"}, expected memory cache`
+        );
+      }
+      const represented = new Set();
+      for (const item of rowsFrom(multiForward.body.data, ["items"]) || []) {
+        for (const node of item?.category_path || []) {
+          const id = String(
+            isObject(node)
+              ? node.id ?? node.cat_id ?? node.category_id ?? node.cid ?? ""
+              : node
+          );
+          if (id) represented.add(id);
+        }
+      }
+      const missingCategories = MULTI_CATEGORY_IDS.filter(
+        (categoryId) => !represented.has(String(categoryId))
+      );
+      if (missingCategories.length) {
+        hard(
+          "multi-category search",
+          `${missingCategories.length} requested category stream(s) contributed no result`
+        );
+      }
+      const forwardTotal = finiteNumber(
+        multiForward.body.data?.total_count ?? multiForward.body.data?.total
+      );
+      const reverseTotal = finiteNumber(
+        multiReverse.body.data?.total_count ?? multiReverse.body.data?.total
+      );
+      if (
+        forwardTotal !== null &&
+        reverseTotal !== null &&
+        forwardTotal !== reverseTotal
+      ) {
+        hard(
+          "multi-category search",
+          `category order changed total (${forwardTotal} vs ${reverseTotal})`
+        );
+      }
+
+      if (paginationExpected(multiForward.body.data, forwardIds.length)) {
+        const multiPage2 = await execute(
+          "multi-category page 2",
+          {
+            path: "/1688/global/search/items",
+            query: multiQuery(MULTI_CATEGORY_IDS, 2),
+          },
+          (data) =>
+            validateSearchPage(
+              "multi-category page 2",
+              data,
+              2,
+              PAGE_SIZE,
+              "default"
+            )
+        );
+        if (multiPage2) {
+          assessPageOverlap(
+            "multi-category pagination",
+            multiForward.body.data,
+            multiPage2.body.data
+          );
+        }
+      }
     }
   }
 

@@ -1,8 +1,11 @@
 #!/usr/bin/env node
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { request } from "playwright";
 import { launchBrowser, acquirePooledBrowser, releaseBrowser, newFastContext } from "./browser.js";
+import { getPlaywrightProxy } from "./proxy.js";
+import { currentJobSignal, jobAbortError } from "./jobContext.js";
 import { toTmapiItemDetail, tmapiError } from "./tmapiFormat.js";
 import { AUTH_PATH, hasSavedAuth } from "./auth.js";
 import {
@@ -16,6 +19,227 @@ const ITEM_SCRAPE_TIMEOUT_MS = Math.max(
   10_000,
   Number(process.env.ITEM_SCRAPE_TIMEOUT_MS) || 34_000
 );
+const ITEM_HTTP_TIMEOUT_MS = Math.max(
+  800,
+  Math.min(10_000, Number(process.env.ITEM_HTTP_TIMEOUT_MS) || 3_500)
+);
+
+export function offerUrlMatches(url, offerId) {
+  try {
+    const parsed = new URL(String(url));
+    const host = parsed.hostname.toLowerCase();
+    if (!(host === "1688.com" || host.endsWith(".1688.com"))) return false;
+    const path = parsed.pathname.replace(/\/+$/, "");
+    return path === `/offer/${String(offerId)}` || path === `/offer/${String(offerId)}.html`;
+  } catch {
+    return false;
+  }
+}
+
+let offerHttpClient = null;
+let offerHttpClientCreating = null;
+const retiredOfferHttpClients = new Set();
+
+async function offerHttpClientSnapshot() {
+  const proxy = getPlaywrightProxy();
+  let storageState;
+  let authKey = "none";
+  try {
+    const [info, raw] = await Promise.all([
+      stat(AUTH_PATH),
+      readFile(AUTH_PATH, "utf8"),
+    ]);
+    storageState = JSON.parse(raw);
+    authKey = `${info.mtimeMs}:${info.size}`;
+  } catch {
+    storageState = { cookies: [], origins: [] };
+  }
+  if (!Array.isArray(storageState.cookies)) storageState.cookies = [];
+  if (!Array.isArray(storageState.origins)) storageState.origins = [];
+
+  const languageCookieIndex = storageState.cookies.findIndex(
+    (cookie) =>
+      cookie?.name === "oversealanguage" &&
+      String(cookie?.domain || "").endsWith("1688.com")
+  );
+  const languageCookie = {
+    name: "oversealanguage",
+    domain: ".1688.com",
+    path: "/",
+    expires: -1,
+    httpOnly: false,
+    secure: false,
+    sameSite: "Lax",
+    ...(languageCookieIndex >= 0
+      ? storageState.cookies[languageCookieIndex]
+      : {}),
+    value: "zh-CN",
+  };
+  if (languageCookieIndex >= 0) {
+    storageState.cookies[languageCookieIndex] = languageCookie;
+  } else {
+    storageState.cookies.push(languageCookie);
+  }
+
+  return {
+    key: `${authKey}:${JSON.stringify(proxy || null)}`,
+    proxy,
+    storageState,
+  };
+}
+
+async function getOfferHttpClient() {
+  const snapshot = await offerHttpClientSnapshot();
+  if (offerHttpClient?.key === snapshot.key) return offerHttpClient.context;
+  if (offerHttpClientCreating) {
+    await offerHttpClientCreating.catch(() => {});
+    return getOfferHttpClient();
+  }
+
+  offerHttpClientCreating = request.newContext({
+    storageState: snapshot.storageState,
+    ...(snapshot.proxy ? { proxy: snapshot.proxy } : {}),
+    extraHTTPHeaders: {
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Upgrade-Insecure-Requests": "1",
+    },
+    userAgent:
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+  });
+
+  try {
+    const context = await offerHttpClientCreating;
+    const previous = offerHttpClient?.context;
+    offerHttpClient = { key: snapshot.key, context };
+    if (previous && previous !== context) {
+      retiredOfferHttpClients.add(previous);
+      const timer = setTimeout(() => {
+        retiredOfferHttpClients.delete(previous);
+        void previous.dispose().catch(() => {});
+      }, 30_000);
+      timer.unref?.();
+    }
+    return context;
+  } finally {
+    offerHttpClientCreating = null;
+  }
+}
+
+async function scrapeOfferHttp(offerId, url, deadline) {
+  const remaining = deadline - Date.now();
+  if (remaining < 800) throw new Error("Item scrape deadline exceeded");
+  const client = await getOfferHttpClient();
+  let response;
+  let removeAbortListener = () => {};
+  const jobSignal = currentJobSignal();
+  try {
+    if (jobSignal?.aborted) throw jobAbortError(jobSignal);
+    const responsePromise = client.get(url, {
+      timeout: Math.min(ITEM_HTTP_TIMEOUT_MS, remaining),
+      failOnStatusCode: false,
+      headers: { Referer: "https://www.1688.com/" },
+    });
+    if (jobSignal) {
+      if (jobSignal.aborted) {
+        await responsePromise.then((late) => late.dispose()).catch(() => {});
+        throw jobAbortError(jobSignal);
+      }
+      const aborted = new Promise((_, reject) => {
+        const onAbort = () => reject(jobAbortError(jobSignal));
+        jobSignal.addEventListener("abort", onAbort, { once: true });
+        removeAbortListener = () => jobSignal.removeEventListener("abort", onAbort);
+      });
+      try {
+        response = await Promise.race([responsePromise, aborted]);
+      } catch (error) {
+        if (error?.cancelled || error?.name === "AbortError") {
+          // Playwright APIRequestContext cannot cancel an individual request.
+          // Keep this queued job active until its short request timeout settles,
+          // otherwise disconnect storms could create unbounded orphan requests.
+          await responsePromise.then((late) => late.dispose()).catch(() => {});
+        }
+        throw error;
+      }
+    } else {
+      response = await responsePromise;
+    }
+    const finalUrl = response.url();
+    const status = response.status();
+    const contentType = response.headers()["content-type"] || "";
+    const html = await response.text();
+    if (jobSignal?.aborted) throw jobAbortError(jobSignal);
+
+    if (
+      /login\.(?:1688|taobao)\.com|member\/signin/i.test(finalUrl) ||
+      (!html.includes("window.context=") &&
+        /login\.1688\.com\/member\/signin|login\.taobao\.com/i.test(html))
+    ) {
+      const error = new Error(
+        "1688 login session is missing or expired; run npm run login:headless"
+      );
+      error.fastFail = true;
+      throw error;
+    }
+    if (status === 429 || /punish|captcha|访问受限/i.test(finalUrl + html.slice(0, 50_000))) {
+      const error = new Error("1688 blocked the direct product request");
+      error.directBlocked = true;
+      throw error;
+    }
+    if (status < 200 || status >= 300) {
+      throw new Error(`Direct product request returned HTTP ${status}`);
+    }
+    if (contentType && !/html|xhtml/i.test(contentType)) {
+      throw new Error(`Direct product request returned ${contentType}`);
+    }
+    if (!offerUrlMatches(finalUrl, offerId)) {
+      throw new Error("Direct product request redirected away from the offer");
+    }
+
+    const parsed = parseOfferContextFromHtml(html);
+    if (!parsed) throw new Error("Direct product HTML did not include offer context");
+    const embeddedId = offerContextId(parsed);
+    if (embeddedId != null && String(embeddedId) !== offerId) {
+      throw new Error(
+        `Direct product HTML contained offer ${embeddedId}, expected ${offerId}`
+      );
+    }
+    const raw = contextToRawOffer(offerId, parsed);
+    if (!isUsableRawOffer(raw)) {
+      throw new Error("Direct product HTML contained incomplete offer data");
+    }
+    return raw;
+  } finally {
+    removeAbortListener();
+    await response?.dispose().catch(() => {});
+  }
+}
+
+function offerContextId(context) {
+  return (
+    context?.result?.data?.Root?.fields?.dataJson?.tempModel?.offerId ??
+    context?.result?.data?.Root?.fields?.dataJson?.offerId ??
+    context?.result?.data?.productTitle?.fields?.offerId ??
+    null
+  );
+}
+
+function rawMatchesOfferId(raw, offerId) {
+  const embeddedId = raw?.tempModel?.offerId ?? raw?.tempModel?.id ?? null;
+  return embeddedId == null || String(embeddedId) === String(offerId);
+}
+
+export async function closeOfferHttpClient() {
+  await offerHttpClientCreating?.catch(() => {});
+  const contexts = [
+    offerHttpClient?.context,
+    ...retiredOfferHttpClients,
+  ].filter(Boolean);
+  offerHttpClient = null;
+  retiredOfferHttpClients.clear();
+  await Promise.allSettled(contexts.map((context) => context.dispose()));
+}
 
 function usage(exitCode = 1) {
   console.error(`Usage:
@@ -348,6 +572,51 @@ export async function getItemDetailById(
   }
 
   const url = `https://detail.1688.com/offer/${offerId}.html`;
+  const finish = async (raw, path) => {
+    if (optimize_title && raw.title) {
+      raw.title = String(raw.title)
+        .replace(/\s+/g, " ")
+        .replace(/(批发|厂家|直销|包邮)/g, "")
+        .trim();
+    }
+
+    const result = toTmapiItemDetail(raw);
+    if (result.code === 200 && lang === "en" && result.data) {
+      await translateItemDetailData(result.data);
+      if (result.data.__translationIncomplete) {
+        Object.defineProperty(result, "__scraperNoCache", {
+          value: true,
+          enumerable: false,
+        });
+      }
+    }
+    Object.defineProperty(result, "__scraperPath", {
+      value: path,
+      enumerable: false,
+    });
+
+    const durationSeconds = Number(
+      ((Date.now() - startedAt) / 1000).toFixed(2)
+    );
+    console.error(
+      `[timing] item_detail ${offerId} (${lang}) ${durationSeconds}s path=${path}`
+    );
+    return result;
+  };
+
+  let lastError;
+  if (!headed) {
+    try {
+      const raw = await scrapeOfferHttp(offerId, url, deadline);
+      return await finish(raw, "http");
+    } catch (err) {
+      lastError = err;
+      if (err?.fastFail || (err?.directBlocked && !(await hasSavedAuth()))) {
+        return tmapiError(500, err.message || "Direct product request failed");
+      }
+    }
+  }
+
   const browser = headed
     ? await launchBrowser({ headed: true })
     : await acquirePooledBrowser();
@@ -361,8 +630,6 @@ export async function getItemDetailById(
   });
 
   try {
-    let lastError;
-
     for (let attempt = 1; attempt <= 2; attempt++) {
       if (Date.now() >= deadline) break;
       const contextOpts = buildContextOpts();
@@ -380,44 +647,25 @@ export async function getItemDetailById(
             documentOnly,
           });
 
-      await context.addCookies([
-        {
-          name: "oversealanguage",
-          value: "zh-CN",
-          domain: ".1688.com",
-          path: "/",
-        },
-      ]);
-
-      const page = await context.newPage();
       try {
+        await context.addCookies([
+          {
+            name: "oversealanguage",
+            value: "zh-CN",
+            domain: ".1688.com",
+            path: "/",
+          },
+        ]);
+
+        const page = await context.newPage();
         const raw = await scrapeOfferFast(page, offerId, url, {
           allowHydrate: !documentOnly,
           deadline,
         });
-        if (!isUsableRawOffer(raw)) {
+        if (!isUsableRawOffer(raw) || !rawMatchesOfferId(raw, offerId)) {
           throw new Error("Could not find product data on the page");
         }
-
-        if (optimize_title && raw.title) {
-          raw.title = String(raw.title)
-            .replace(/\s+/g, " ")
-            .replace(/(批发|厂家|直销|包邮)/g, "")
-            .trim();
-        }
-
-        const result = toTmapiItemDetail(raw);
-        if (result.code === 200 && lang === "en" && result.data) {
-          await translateItemDetailData(result.data);
-        }
-
-        const durationSeconds = Number(
-          ((Date.now() - startedAt) / 1000).toFixed(2)
-        );
-        console.error(
-          `[timing] item_detail ${offerId} (${lang}) ${durationSeconds}s`
-        );
-        return result;
+        return await finish(raw, "browser");
       } catch (err) {
         lastError = err;
         if (/login session|required login|login wall/i.test(err?.message || "")) {
@@ -455,7 +703,7 @@ async function scrapeOfferFast(
         loginWall = true;
         return;
       }
-      if (!res.url().includes(`/offer/${offerId}`)) return;
+      if (!offerUrlMatches(res.url(), offerId)) return;
       const html = await res.text();
       htmlBytes = html.length;
       if (
@@ -466,7 +714,7 @@ async function scrapeOfferFast(
         return;
       }
       const ctx = parseOfferContextFromHtml(html);
-      if (ctx) {
+      if (ctx && (offerContextId(ctx) == null || String(offerContextId(ctx)) === offerId)) {
         const raw = contextToRawOffer(offerId, ctx);
         if (isUsableRawOffer(raw)) fromHtml = raw;
       }
@@ -483,6 +731,10 @@ async function scrapeOfferFast(
       waitUntil: allowHydrate ? "domcontentloaded" : "commit",
       timeout: Math.min(allowHydrate ? 18_000 : 12_000, remaining),
     });
+
+    if (!offerUrlMatches(page.url(), offerId)) {
+      throw new Error("Product page redirected away from the requested offer");
+    }
 
     if (
       loginWall ||
@@ -559,8 +811,10 @@ const isDirectRun =
   import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 
 if (isDirectRun) {
-  main().catch((err) => {
-    console.error(`Scrape failed: ${err.message}`);
-    process.exit(1);
-  });
+  main()
+    .catch((err) => {
+      console.error(`Scrape failed: ${err.message}`);
+      process.exitCode = 1;
+    })
+    .finally(() => closeOfferHttpClient());
 }

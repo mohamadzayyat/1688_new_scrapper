@@ -3,7 +3,7 @@ import { timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getItemDetailById } from "./scrape.js";
+import { closeOfferHttpClient, getItemDetailById } from "./scrape.js";
 import { searchOffers } from "./search.js";
 import { tmapiError } from "./tmapiFormat.js";
 import { convertImageUrl, parseOfferUrl } from "./tmapiExtra.js";
@@ -22,7 +22,13 @@ import {
   searchItemsCrossBorder,
   searchByImageCrossBorder,
 } from "./extraScrape.js";
-import { enqueueJob, jobQueueStats, recommendedHardware } from "./jobQueue.js";
+import {
+  enqueueJob,
+  runSerializedJob,
+  jobQueueStats,
+  recommendedHardware,
+} from "./jobQueue.js";
+import { runWithJobSignal } from "./jobContext.js";
 import { cacheKey, cached, cachedSwr, cacheStats } from "./cache.js";
 import {
   warmBrowserPool,
@@ -72,10 +78,13 @@ const META_CACHE_TTL = Math.max(
 function sendJson(res, status, body) {
   if (res.headersSent || res.writableEnded) return;
   const payload = JSON.stringify(body);
-  res.writeHead(status, {
+  const headers = {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
-  });
+  };
+  if (body?.__scraperCache) headers["X-Scraper-Cache"] = body.__scraperCache;
+  if (body?.__scraperPath) headers["X-Scraper-Path"] = body.__scraperPath;
+  res.writeHead(status, headers);
   res.end(payload);
 }
 
@@ -109,44 +118,116 @@ async function serveStatic(req, res) {
  * Concurrent job runner (queue) — up to MAX_CONCURRENT scrapes in parallel.
  * Instant tools (parse/convert) should NOT use this.
  */
-async function withJob(res, label, fn, { tmapi = true, cacheTtl = 0, cacheParts = null, swr = false } = {}) {
+function categorySerialKey({ categories, keyword, sort, priceStart, priceEnd, language }) {
+  if (!categories) return null;
+  return JSON.stringify([
+    "category-stream",
+    categories,
+    String(keyword || "*").trim() || "*",
+    String(sort || "default").trim().toLowerCase(),
+    String(priceStart || "").trim(),
+    String(priceEnd || "").trim(),
+    String(language || "en").trim().toLowerCase(),
+  ]);
+}
+
+async function withJob(res, label, fn, { tmapi = true, cacheTtl = 0, cacheParts = null, swr = false, serialKey = null } = {}) {
+  const controller = new AbortController();
+  let rejectClientClosed;
+  const clientClosed = new Promise((_, reject) => {
+    rejectClientClosed = reject;
+  });
+  const abortOnClose = () => {
+    if (!res.writableFinished) {
+      const error = new Error("Client disconnected before the scrape completed");
+      error.code = 499;
+      error.cancelled = true;
+      rejectClientClosed(error);
+      controller.abort(error);
+    }
+  };
+  res.once("close", abortOnClose);
+  if (res.destroyed || res.closed) abortOnClose();
+  let timer;
   try {
     // Cache and singleflight are outside the scrape queue so memory/disk hits
     // never wait behind Chromium work. Every miss and SWR refresh still enters
     // the same bounded queue through `produce`.
-    const produce = () => enqueueJob(label, fn);
+    const produce = (sourceSignal = controller.signal) => {
+      const workController = new AbortController();
+      const forwardAbort = () => workController.abort(sourceSignal?.reason);
+      if (sourceSignal?.aborted) forwardAbort();
+      else sourceSignal?.addEventListener("abort", forwardAbort, { once: true });
+      let workTimer;
+      const workDeadline = new Promise((_, reject) => {
+        workTimer = setTimeout(() => {
+          const error = new Error(`Scrape work exceeded ${REQUEST_TIMEOUT_MS}ms`);
+          error.code = 504;
+          reject(error);
+          workController.abort(error);
+        }, REQUEST_TIMEOUT_MS);
+      });
+      workTimer.unref?.();
+      // Defer the call because enqueueJob can reject synchronously when the
+      // queue is full. The shared finally must always clear timer/listener state.
+      const queuedWork = Promise.resolve().then(() =>
+        runSerializedJob(
+          serialKey,
+          () =>
+            enqueueJob(
+              label,
+              () => runWithJobSignal(workController.signal, fn),
+              { signal: workController.signal }
+            ),
+          { signal: workController.signal }
+        )
+      );
+      return Promise.race([queuedWork, workDeadline]).finally(() => {
+        clearTimeout(workTimer);
+        sourceSignal?.removeEventListener("abort", forwardAbort);
+      });
+    };
     let work;
     if (cacheTtl > 0 && cacheParts) {
       const key = cacheKey(cacheParts);
       work = swr
-        ? cachedSwr(key, cacheTtl, produce)
-        : cached(key, cacheTtl, produce);
+        ? cachedSwr(key, cacheTtl, produce, { signal: controller.signal })
+        : cached(key, cacheTtl, produce, { signal: controller.signal });
     } else {
-      work = produce();
+      work = produce(controller.signal);
     }
 
-    let timer;
     const deadline = new Promise((_, reject) => {
       timer = setTimeout(() => {
         const err = new Error(`Request exceeded ${REQUEST_TIMEOUT_MS}ms`);
         err.code = 504;
         reject(err);
+        controller.abort(err);
       }, REQUEST_TIMEOUT_MS);
       timer.unref?.();
     });
-    const data = await Promise.race([work, deadline]).finally(() => clearTimeout(timer));
+    const data = await Promise.race([work, deadline, clientClosed]);
     if (tmapi) sendTmapi(res, data);
     else sendJson(res, 200, data);
   } catch (err) {
     const code =
       err?.code === 439 || err?.queueFull
         ? 439
-        : err?.code === 504
-          ? 504
-          : 500;
+        : err?.code === 499 || err?.cancelled
+          ? 499
+          : err?.code === 504
+            ? 504
+            : 500;
     const msg = err.message || "Request failed";
     if (tmapi) sendTmapi(res, tmapiError(code, msg));
-    else sendJson(res, code === 439 ? 429 : code === 504 ? 504 : 502, { error: msg });
+    else sendJson(
+      res,
+      code === 439 ? 429 : code === 499 ? 499 : code === 504 ? 504 : 502,
+      { error: msg }
+    );
+  } finally {
+    clearTimeout(timer);
+    res.off("close", abortOnClose);
   }
 }
 
@@ -373,17 +454,55 @@ async function handleSearchItems(req, res) {
   const page_size = Number(url.searchParams.get("page_size") || 20);
   const sort = url.searchParams.get("sort") || "default";
   const language = normalizeLanguage(url.searchParams.get("language") || "en");
-  const cat_id = url.searchParams.get("cat_id") || "";
+  const cat_id = [...new Set(
+    String(
+      url.searchParams.get("cat_ids") || url.searchParams.get("cat_id") || ""
+    )
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean)
+  )]
+    .sort((left, right) => left.localeCompare(right, "en", { numeric: true }))
+    .join(",");
+  const priceStart = url.searchParams.get("price_start") || "";
+  const priceEnd = url.searchParams.get("price_end") || "";
   if (!keyword && !cat_id) {
     sendTmapi(res, tmapiError(422, "keyword is required"));
     return;
   }
   await withJob(res, `search:${keyword || cat_id}:${page}`, () =>
-    searchItemsTmapi({ keyword, page, page_size, sort, language, cat_id }),
+    searchItemsTmapi({
+      keyword,
+      page,
+      page_size,
+      sort,
+      language,
+      cat_id,
+      price_start: priceStart,
+      price_end: priceEnd,
+    }),
     {
       tmapi: true,
       cacheTtl: SEARCH_CACHE_TTL,
-      cacheParts: ["search", keyword, cat_id, page, page_size, sort, language],
+      cacheParts: [
+        "search",
+        keyword,
+        cat_id,
+        priceStart,
+        priceEnd,
+        page,
+        page_size,
+        sort,
+        language,
+      ],
+      serialKey: categorySerialKey({
+        categories: cat_id,
+        keyword,
+        sort,
+        priceStart,
+        priceEnd,
+        language,
+      }),
     }
   );
 }
@@ -606,14 +725,22 @@ async function handleCategoryProducts(req, res) {
     return;
   }
   const url = new URL(req.url, `http://${req.headers.host}`);
+  const categoryId = url.searchParams.get("cat_id") || "";
+  const keyword = url.searchParams.get("keyword") || "*";
+  const sort = url.searchParams.get("sort") || "default";
+  const language = normalizeLanguage(url.searchParams.get("language") || "en");
+  const priceStart = url.searchParams.get("price_start") || "";
+  const priceEnd = url.searchParams.get("price_end") || "";
   await withJob(res, `category_products`, () =>
     getCategoryProducts({
-      cat_id: url.searchParams.get("cat_id") || "",
-      keyword: url.searchParams.get("keyword") || "*",
+      cat_id: categoryId,
+      keyword,
       page: Number(url.searchParams.get("page") || 1),
       page_size: Number(url.searchParams.get("page_size") || 20),
-      sort: url.searchParams.get("sort") || "default",
-      language: normalizeLanguage(url.searchParams.get("language") || "en"),
+      sort,
+      language,
+      price_start: priceStart,
+      price_end: priceEnd,
     }),
     {
       cacheTtl: LIST_CACHE_TTL,
@@ -624,9 +751,19 @@ async function handleCategoryProducts(req, res) {
         url.searchParams.get("page"),
         url.searchParams.get("page_size"),
         url.searchParams.get("sort"),
+        url.searchParams.get("price_start"),
+        url.searchParams.get("price_end"),
         url.searchParams.get("language"),
       ],
       swr: true,
+      serialKey: categorySerialKey({
+        categories: categoryId,
+        keyword,
+        sort,
+        priceStart,
+        priceEnd,
+        language,
+      }),
     }
   );
 }
@@ -638,11 +775,22 @@ async function handleCrossSearchItems(req, res) {
   }
   const url = new URL(req.url, `http://${req.headers.host}`);
   const keyword = url.searchParams.get("keyword") || "";
-  const catId = url.searchParams.get("cat_id") || "";
+  const catId = [...new Set(
+    String(
+      url.searchParams.get("cat_ids") || url.searchParams.get("cat_id") || ""
+    )
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean)
+  )]
+    .sort((left, right) => left.localeCompare(right, "en", { numeric: true }))
+    .join(",");
   const page = Number(url.searchParams.get("page") || 1);
   const pageSize = Number(url.searchParams.get("page_size") || 20);
   const sort = url.searchParams.get("sort") || "default";
   const language = normalizeLanguage(url.searchParams.get("language") || "en");
+  const priceStart = url.searchParams.get("price_start") || "";
+  const priceEnd = url.searchParams.get("price_end") || "";
   await withJob(
     res,
     `cross_search_items:${keyword || catId}:${page}`,
@@ -654,11 +802,31 @@ async function handleCrossSearchItems(req, res) {
         page_size: pageSize,
         sort,
         language,
+        price_start: priceStart,
+        price_end: priceEnd,
       }),
     {
       cacheTtl: SEARCH_CACHE_TTL,
-      cacheParts: ["cross_search", keyword, catId, page, pageSize, sort, language],
+      cacheParts: [
+        "cross_search",
+        keyword,
+        catId,
+        priceStart,
+        priceEnd,
+        page,
+        pageSize,
+        sort,
+        language,
+      ],
       swr: true,
+      serialKey: categorySerialKey({
+        categories: catId,
+        keyword,
+        sort,
+        priceStart,
+        priceEnd,
+        language,
+      }),
     }
   );
 }
@@ -866,16 +1034,35 @@ const ROUTES = [
   ["/api/search", handleLegacySearch],
 ];
 
-async function handleHealth(_req, res) {
+async function handleHealth(req, res) {
   const auth = await assertAuthLooksValid();
-  sendJson(res, 200, {
+  const browsers = browserPoolStats();
+  const requiredBrowsers = 1;
+  if (browsers.live < requiredBrowsers && !browsers.closing && !browsers.closed) {
+    void warmBrowserPool().catch(() => {});
+  }
+  const ready =
+    auth.ok &&
+    !browsers.closing &&
+    !browsers.closed &&
+    browsers.live >= requiredBrowsers;
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const summary = {
     ok: true,
-    ready: auth.ok,
+    status: "ok",
+    ready,
+  };
+  if (!requestIsAuthorized(req, url)) {
+    sendJson(res, 200, summary);
+    return;
+  }
+  sendJson(res, 200, {
+    ...summary,
     auth,
     security: { apiTokenRequired: Boolean(SCRAPER_API_TOKEN) },
     uptimeSec: Math.round(process.uptime()),
     queue: jobQueueStats(),
-    browsers: browserPoolStats(),
+    browsers,
     cache: cacheStats(),
     hardware: recommendedHardware(),
   });
@@ -884,8 +1071,16 @@ async function handleHealth(_req, res) {
 async function handleReady(_req, res) {
   const auth = await assertAuthLooksValid();
   const browsers = browserPoolStats();
-  const ready = auth.ok && !browsers.closing && !browsers.closed;
-  sendJson(res, ready ? 200 : 503, { ready, auth, browsers });
+  const requiredBrowsers = 1;
+  if (browsers.live < requiredBrowsers && !browsers.closing && !browsers.closed) {
+    void warmBrowserPool().catch(() => {});
+  }
+  const ready =
+    auth.ok &&
+    !browsers.closing &&
+    !browsers.closed &&
+    browsers.live >= requiredBrowsers;
+  sendJson(res, ready ? 200 : 503, { ready });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -950,7 +1145,7 @@ async function shutdown(signal) {
   forceTimer.unref?.();
   await stopped.catch(() => {});
   clearTimeout(forceTimer);
-  await closeBrowserPool().catch(() => {});
+  await Promise.allSettled([closeOfferHttpClient(), closeBrowserPool()]);
 }
 
 process.once("SIGTERM", () => void shutdown("SIGTERM"));

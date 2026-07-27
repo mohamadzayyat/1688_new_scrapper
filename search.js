@@ -1,7 +1,11 @@
 import { assertAuthLooksValid, newAuthedContext } from "./auth.js";
 import { launchBrowser, acquirePooledBrowser, releaseBrowser } from "./browser.js";
 import { proxyStatus } from "./proxy.js";
-import { normalizeLang, translateTexts } from "./translate.js";
+import {
+  markIfTranslationIncomplete,
+  normalizeLang,
+  translateTexts,
+} from "./translate.js";
 
 const SEARCH_TIMEOUT_MS = Math.max(
   10_000,
@@ -33,18 +37,45 @@ function keywordToHexPath(keyword) {
   return Buffer.from(String(keyword), "utf8").toString("hex");
 }
 
-function buildMobileSearchUrl(keyword, page) {
-  const hex = keywordToHexPath(keyword);
-  return `https://m.1688.com/offer_search/-${hex}.html?beginPage=${page}`;
+function normalizeSearchSort(sort) {
+  const value = String(sort || "default").trim().toLowerCase().replace(/-/g, "_");
+  return {
+    sales: "booked",
+    sales_desc: "booked",
+    booked: "booked",
+    price_up: "price-asc",
+    priceup: "price-asc",
+    price_asc: "price-asc",
+    price_down: "price-desc",
+    pricedown: "price-desc",
+    price_desc: "price-desc",
+    new: "newOffer",
+    newest: "newOffer",
+    new_offer: "newOffer",
+  }[value];
 }
 
-function buildDesktopSearchUrl(keyword, page) {
-  return (
-    "https://s.1688.com/selloffer/offer_search.htm?keywords=" +
-    encodeURIComponent(keyword) +
-    "&beginPage=" +
-    page
-  );
+function applySearchQuery(url, { sort, priceStart, priceEnd, pageSize } = {}) {
+  const sortType = normalizeSearchSort(sort);
+  if (sortType) url.searchParams.set("sortType", sortType);
+  if (priceStart !== "") url.searchParams.set("priceStart", String(priceStart));
+  if (priceEnd !== "") url.searchParams.set("priceEnd", String(priceEnd));
+  if (pageSize) url.searchParams.set("pageSize", String(pageSize));
+  return url;
+}
+
+function buildMobileSearchUrl(keyword, page, filters = {}) {
+  const hex = keywordToHexPath(keyword);
+  const url = new URL(`https://m.1688.com/offer_search/-${hex}.html`);
+  url.searchParams.set("beginPage", String(page));
+  return applySearchQuery(url, filters).toString();
+}
+
+function buildDesktopSearchUrl(keyword, page, filters = {}) {
+  const url = new URL("https://s.1688.com/selloffer/offer_search.htm");
+  url.searchParams.set("keywords", keyword);
+  url.searchParams.set("beginPage", String(page));
+  return applySearchQuery(url, filters).toString();
 }
 
 function normalizeDesktopOffer(item) {
@@ -76,11 +107,18 @@ function normalizeDesktopOffer(item) {
 async function applySearchLanguage(items, lang) {
   if (lang !== "en" || !items.length) return items;
   const translated = await translateTexts(items.map((item) => item.title));
-  return items.map((item, i) => ({
+  const output = items.map((item, i) => ({
     ...item,
     titleOriginal: item.title,
     title: translated[i] || item.title,
   }));
+  if (translated.__translationComplete === false) {
+    Object.defineProperty(output, "__translationIncomplete", {
+      value: true,
+      enumerable: false,
+    });
+  }
+  return output;
 }
 
 async function withLangCookies(context, lang) {
@@ -94,7 +132,14 @@ async function withLangCookies(context, lang) {
   ]);
 }
 
-async function tryDesktopSearch(browser, keyword, pageNo, lang = "zh", deadline = Infinity) {
+async function tryDesktopSearch(
+  browser,
+  keyword,
+  pageNo,
+  lang = "zh",
+  deadline = Infinity,
+  filters = {}
+) {
   const context = await newAuthedContext(browser, {
     locale: lang === "en" ? "en-US" : "zh-CN",
     viewport: { width: 1440, height: 900 },
@@ -107,7 +152,7 @@ async function tryDesktopSearch(browser, keyword, pageNo, lang = "zh", deadline 
   try {
     await withLangCookies(context, lang);
     const page = await context.newPage();
-    await page.goto(buildDesktopSearchUrl(keyword, pageNo), {
+    await page.goto(buildDesktopSearchUrl(keyword, pageNo, filters), {
       waitUntil: "domcontentloaded",
       timeout: remainingTimeout(deadline, 12_000),
     });
@@ -158,7 +203,14 @@ function loginHelpMessage() {
   );
 }
 
-async function scrapeMobileSearch(browser, keyword, pageNo, lang = "zh", deadline = Infinity) {
+async function scrapeMobileSearch(
+  browser,
+  keyword,
+  pageNo,
+  lang = "zh",
+  deadline = Infinity,
+  filters = {}
+) {
   const context = await newAuthedContext(browser, {
     isMobile: true,
     hasTouch: true,
@@ -173,7 +225,7 @@ async function scrapeMobileSearch(browser, keyword, pageNo, lang = "zh", deadlin
   try {
     await withLangCookies(context, lang);
     const page = await context.newPage();
-    await page.goto(buildMobileSearchUrl(keyword, pageNo), {
+    await page.goto(buildMobileSearchUrl(keyword, pageNo, filters), {
       waitUntil: "domcontentloaded",
       timeout: remainingTimeout(deadline, 15_000),
     });
@@ -275,17 +327,27 @@ async function scrapeMobileSearch(browser, keyword, pageNo, lang = "zh", deadlin
 /**
  * Search 1688 offers by keyword with pagination.
  * @param {string} keyword
- * @param {{ page?: number, headed?: boolean, lang?: string }} [options]
+ * @param {{ page?: number, pageSize?: number, headed?: boolean, lang?: string, sort?: string, priceStart?: string, priceEnd?: string }} [options]
  */
 export async function searchOffers(
   keyword,
-  { page = 1, headed = false, lang = "zh" } = {}
+  {
+    page = 1,
+    pageSize = 20,
+    headed = false,
+    lang = "zh",
+    sort = "default",
+    priceStart = "",
+    priceEnd = "",
+  } = {}
 ) {
   const startedAt = Date.now();
   const deadline = startedAt + SEARCH_TIMEOUT_MS;
   const q = String(keyword || "").trim();
   const pageNo = Math.max(1, Number(page) || 1);
+  const requestedPageSize = Math.min(50, Math.max(1, Number(pageSize) || 20));
   const language = normalizeLang(lang);
+  const filters = { sort, priceStart, priceEnd, pageSize: requestedPageSize };
 
   if (!q) throw new Error("Search keyword is required");
 
@@ -316,7 +378,8 @@ export async function searchOffers(
             q,
             pageNo,
             language,
-            deadline
+            deadline,
+            filters
           );
           if (desktop?.items?.length) {
             raw = {
@@ -333,13 +396,17 @@ export async function searchOffers(
             q,
             pageNo,
             language,
-            deadline
+            deadline,
+            filters
           );
         }
 
         if (!raw.items.length) throw new Error("Search returned zero offers");
 
-        const results = await applySearchLanguage(raw.items, language);
+        const results = await applySearchLanguage(
+          raw.items.slice(0, requestedPageSize),
+          language
+        );
 
         const pageSize = results.length;
         const total = Number.isFinite(raw.total) ? raw.total : null;
@@ -356,7 +423,7 @@ export async function searchOffers(
           `[timing] search "${q}" p${pageNo} (${language}) ${timing.durationSeconds}s`
         );
 
-        return {
+        return markIfTranslationIncomplete({
           keyword: q,
           language,
           page: pageNo,
@@ -372,10 +439,10 @@ export async function searchOffers(
           scrapedAt: new Date().toISOString(),
           url:
             raw.source === "desktop"
-              ? buildDesktopSearchUrl(q, pageNo)
-              : buildMobileSearchUrl(q, pageNo),
+              ? buildDesktopSearchUrl(q, pageNo, filters)
+              : buildMobileSearchUrl(q, pageNo, filters),
           results,
-        };
+        }, results);
       } catch (err) {
         lastError = err;
         if (attempt === SEARCH_ATTEMPTS || Date.now() >= deadline) break;

@@ -4,7 +4,12 @@
 import { acquirePooledBrowser, releaseBrowser } from "./browser.js";
 import { newAuthedContext, assertAuthLooksValid } from "./auth.js";
 import { proxyStatus } from "./proxy.js";
-import { normalizeLang, translateTexts } from "./translate.js";
+import {
+  markIfTranslationIncomplete,
+  markResponseUncacheable,
+  normalizeLang,
+  translateTexts,
+} from "./translate.js";
 import {
   tmapiOk,
   tmapiError,
@@ -12,6 +17,7 @@ import {
   toTmapiShopItems,
 } from "./tmapiExtra.js";
 import { searchOffers } from "./search.js";
+import { currentJobSignal, jobAbortError } from "./jobContext.js";
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -391,6 +397,76 @@ function normalizeSort(sort) {
   return "default";
 }
 
+function numericOfferValue(value) {
+  const text = String(value ?? "").replace(/,/g, "").trim();
+  const match = text.match(/\d+(?:\.\d+)?/);
+  if (!match) return null;
+  let number = Number(match[0]);
+  if (/万/.test(text)) number *= 10_000;
+  return Number.isFinite(number) ? number : null;
+}
+
+function normalizePriceRange(priceStart, priceEnd) {
+  const startText = String(priceStart ?? "").trim();
+  const endText = String(priceEnd ?? "").trim();
+  const start = startText === "" ? null : Number(startText);
+  const end = endText === "" ? null : Number(endText);
+  if (start != null && (!Number.isFinite(start) || start < 0)) {
+    return { error: "price_start must be a non-negative number" };
+  }
+  if (end != null && (!Number.isFinite(end) || end < 0)) {
+    return { error: "price_end must be a non-negative number" };
+  }
+  if (start != null && end != null && start > end) {
+    return { error: "price_start must not be greater than price_end" };
+  }
+  return {
+    priceStart: start == null ? "" : String(start),
+    priceEnd: end == null ? "" : String(end),
+  };
+}
+
+function filterAndSortOffers(
+  items,
+  { price_start = "", price_end = "", sort = "default" } = {}
+) {
+  let output = [...(items || [])];
+  const minPrice = price_start !== "" ? Number(price_start) : null;
+  const maxPrice = price_end !== "" ? Number(price_end) : null;
+  if (Number.isFinite(minPrice)) {
+    output = output.filter((item) => {
+      const price = numericOfferValue(item.price);
+      return price != null && price >= minPrice;
+    });
+  }
+  if (Number.isFinite(maxPrice)) {
+    output = output.filter((item) => {
+      const price = numericOfferValue(item.price);
+      return price != null && price <= maxPrice;
+    });
+  }
+  const normalized = normalizeSort(sort);
+  if (normalized === "price_up" || normalized === "price_down") {
+    const direction = normalized === "price_up" ? 1 : -1;
+    output.sort((left, right) => {
+      const leftPrice = numericOfferValue(left.price);
+      const rightPrice = numericOfferValue(right.price);
+      // Incomplete network-captured cards must stay behind priced products for
+      // both ascending and descending order.
+      if (leftPrice == null) return rightPrice == null ? 0 : 1;
+      if (rightPrice == null) return -1;
+      return direction * (leftPrice - rightPrice);
+    });
+  } else if (normalized === "sales") {
+    output.sort(
+      (left, right) =>
+        (numericOfferValue(right.sales ?? right.sale_quantity) ?? 0) -
+        (numericOfferValue(left.sales ?? left.sale_quantity) ?? 0)
+    );
+  }
+  return output;
+}
+
 function applySearchSort(params, sort) {
   const normalized = normalizeSort(sort);
   const sortType = {
@@ -417,7 +493,7 @@ function shopOfferListUrl(
   shopUrl,
   memberId,
   pageNo,
-  { pageSize, categoryId, sort } = {}
+  { pageSize, categoryId, sort, priceStart, priceEnd, keyword } = {}
 ) {
   let target;
   if (memberId) {
@@ -444,6 +520,12 @@ function shopOfferListUrl(
   target.searchParams.set("pageNum", String(pageNo));
   if (pageSize) target.searchParams.set("pageSize", String(pageSize));
   if (categoryId) target.searchParams.set("categoryId", String(categoryId));
+  if (keyword) {
+    target.searchParams.set("keyword", String(keyword));
+    target.searchParams.set("keywords", String(keyword));
+  }
+  if (priceStart !== "") target.searchParams.set("priceStart", String(priceStart));
+  if (priceEnd !== "") target.searchParams.set("priceEnd", String(priceEnd));
   applyShopSort(target.searchParams, sort);
   return target.toString();
 }
@@ -483,7 +565,10 @@ export async function getShopItems({
   language = "zh",
 } = {}) {
   let mid = extractMemberId(shop_url, member_id);
-
+  const priceRange = normalizePriceRange(price_start, price_end);
+  if (priceRange.error) return tmapiError(422, priceRange.error);
+  price_start = priceRange.priceStart;
+  price_end = priceRange.priceEnd;
   const lang = normalizeLang(language);
   const pageNo = Math.max(1, Number(page) || 1);
   const size = Math.min(50, Math.max(1, Number(page_size) || 20));
@@ -492,6 +577,9 @@ export async function getShopItems({
     pageSize: size,
     categoryId: selectedCategoryId,
     sort,
+    priceStart: price_start,
+    priceEnd: price_end,
+    keyword: String(keyword || "").trim(),
   };
   let offerListUrl = shopOfferListUrl(shop_url, mid, pageNo, listOptions);
   if (!offerListUrl) {
@@ -510,17 +598,8 @@ export async function getShopItems({
     await withLangCookies(context, lang);
     const p = await context.newPage();
     const netIds = new Set();
-    const onResp = async (res) => {
-      try {
-        const u = res.url();
-        if (!/winport|offer|asyncView|mtop/i.test(u)) return;
-        const text = await res.text();
-        if (text && text.length < 2_000_000) collectOfferIdsFromText(text, netIds);
-      } catch {
-        /* ignore */
-      }
-    };
-    p.on("response", onResp);
+    let networkTotal = null;
+    let onResp = null;
 
     try {
       if (!mid && shop_url) {
@@ -538,18 +617,53 @@ export async function getShopItems({
           offerListUrl = shopOfferListUrl("", mid, pageNo, listOptions);
         }
       }
+      let signalNetworkReady;
+      const networkReady = new Promise((resolveReady) => {
+        signalNetworkReady = resolveReady;
+      });
+      onResp = async (res) => {
+        try {
+          const responseUrl = res.url();
+          if (!/winport\.m\.1688\.com|asyncView|mtop/i.test(responseUrl)) return;
+          if (res.status() < 200 || res.status() >= 300) return;
+          if (!["document", "xhr", "fetch"].includes(res.request().resourceType())) return;
+          const headers = res.headers();
+          const contentLength = Number(headers["content-length"] || 0);
+          if (contentLength > 2_000_000) return;
+          const contentType = headers["content-type"] || "";
+          if (contentType && !/json|javascript|text|html/i.test(contentType)) return;
+          const text = await res.text();
+          if (text && text.length < 2_000_000) {
+            collectOfferIdsFromText(text, netIds);
+            for (const match of text.matchAll(
+              /["'](?:totalCount|total_count|total)["']\s*:\s*["']?(\d+)/gi
+            )) {
+              const value = Number(match[1]);
+              if (Number.isFinite(value)) {
+                networkTotal = Math.max(networkTotal ?? 0, value);
+              }
+            }
+          }
+          if (netIds.size > 0) signalNetworkReady();
+        } catch {
+          /* ignore */
+        }
+      };
+      p.on("response", onResp);
       await p.goto(offerListUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
       assertNotLoginPage(p, "shop items");
-      await p
+      const domReady = p
         .waitForFunction(
           () =>
+            /login\.(?:taobao|1688)\.com|member\/signin/i.test(location.href) ||
             document.querySelectorAll(
               "a[href*='offer/'], [offerid], [data-offer-id]"
             ).length > 0,
           null,
           { timeout: 6_000 }
         )
-        .catch(() => {});
+        .catch(() => null);
+      await Promise.race([networkReady, domReady, p.waitForTimeout(6_000)]);
       assertNotLoginPage(p, "shop items");
       for (let i = 0; i < 2; i++) {
         await p.evaluate(() => window.scrollBy(0, 700));
@@ -611,7 +725,32 @@ export async function getShopItems({
         const company =
           document.querySelector("title")?.textContent?.replace(/[-_].*$/, "").trim() ||
           "";
-        return { company, items, member_id: null };
+        const pageData = window.data || window.__INITIAL_STATE__ || {};
+        const totalCandidate =
+          pageData.totalCount ??
+          pageData.total ??
+          pageData.offerList?.totalCount ??
+          pageData.offerList?.total ??
+          pageData.offerListData?.totalCount ??
+          null;
+        const textTotal = (
+          (document.body?.innerText || "").match(/(?:å…±|共)\s*([\d,ï¼Œ]+)\s*(?:ä»¶|件)/) ||
+          []
+        )[1];
+        const parsedTextTotal = textTotal
+          ? Number(String(textTotal).replace(/[,ï¼Œ]/g, ""))
+          : null;
+        return {
+          company,
+          items,
+          member_id: null,
+          total:
+            totalCandidate != null && Number.isFinite(Number(totalCandidate))
+              ? Number(totalCandidate)
+              : Number.isFinite(parsedTextTotal)
+                ? parsedTextTotal
+                : null,
+        };
       });
 
       // merge network-captured ids
@@ -633,55 +772,37 @@ export async function getShopItems({
           `${it.title}`.toLowerCase().includes(String(keyword).toLowerCase())
         );
       }
-      const minPrice = price_start !== "" ? Number(price_start) : null;
-      const maxPrice = price_end !== "" ? Number(price_end) : null;
-      const numericPrice = (item) => {
-        const match = String(item.price ?? "").match(/\d+(?:\.\d+)?/);
-        return match ? Number(match[0]) : null;
-      };
-      if (Number.isFinite(minPrice)) {
-        items = items.filter((item) => {
-          const price = numericPrice(item);
-          return price != null && price >= minPrice;
-        });
-      }
-      if (Number.isFinite(maxPrice)) {
-        items = items.filter((item) => {
-          const price = numericPrice(item);
-          return price != null && price <= maxPrice;
-        });
-      }
-      const normalizedSort = normalizeSort(sort);
-      if (normalizedSort === "price_up" || normalizedSort === "price_down") {
-        const direction = normalizedSort === "price_up" ? 1 : -1;
-        items.sort(
-          (left, right) =>
-            direction * ((numericPrice(left) ?? Infinity) - (numericPrice(right) ?? Infinity))
-        );
-      } else if (normalizedSort === "sales") {
-        items.sort(
-          (left, right) =>
-            Number(right.sale_quantity || 0) - Number(left.sale_quantity || 0)
-        );
-      }
+      items = filterAndSortOffers(items, { price_start, price_end, sort });
 
       // The upstream URL already selects pageNo. Only cap that page to page_size;
       // applying the page offset again made every page after page 1 go empty.
       const pageItems = items.slice(0, size);
 
-      if (!pageItems.length) {
+      const knownTotal = networkTotal ?? scraped.total;
+      if (!pageItems.length && knownTotal !== 0) {
         return tmapiError(502, "No shop products were extracted from 1688");
       }
 
+      let translatedTitles = null;
       if (lang === "en" && pageItems.length) {
-        const titles = await translateTexts(pageItems.map((i) => i.title || i.item_id));
+        translatedTitles = await translateTexts(
+          pageItems.map((i) => i.title || i.item_id)
+        );
         for (let i = 0; i < pageItems.length; i++) {
-          if (pageItems[i].title) pageItems[i].title = titles[i] || pageItems[i].title;
+          if (pageItems[i].title) {
+            pageItems[i].title = translatedTitles[i] || pageItems[i].title;
+          }
         }
       }
 
-      return toTmapiShopItems(
-        { total_count: items.length, items: pageItems },
+      return markIfTranslationIncomplete(toTmapiShopItems(
+        {
+          total_count:
+            knownTotal ??
+            (pageNo - 1) * size + pageItems.length +
+              (pageItems.length >= size ? 1 : 0),
+          items: pageItems,
+        },
         {
           page: pageNo,
           page_size: size,
@@ -689,9 +810,9 @@ export async function getShopItems({
           keyword,
           cat: selectedCategoryId,
         }
-      );
+      ), translatedTitles);
     } finally {
-      p.off("response", onResp);
+      if (onResp) p.off("response", onResp);
     }
   } catch (err) {
     return tmapiError(500, err.message || "shop items failed");
@@ -724,6 +845,7 @@ export async function getShopInfo({ shop_url, member_id, language = "zh" } = {})
       await page
         .waitForFunction(
           () =>
+            /login\.(?:taobao|1688)\.com|member\/signin/i.test(location.href) ||
             Boolean(
               document.querySelector(
                 "h1,h2,[class*='company'],[class*='shop-name']"
@@ -797,6 +919,7 @@ export async function getShopCategories({
       await page
         .waitForFunction(
           () =>
+            /login\.(?:taobao|1688)\.com|member\/signin/i.test(location.href) ||
             document.querySelectorAll(
               "a[href*='cat'], a[href*='category'], [class*='category']"
             ).length > 0,
@@ -860,9 +983,15 @@ export async function searchItemsTmapi({
   sort = "default",
   language = "zh",
   cat_id = "",
+  price_start = "",
+  price_end = "",
 } = {}) {
   const q = String(keyword || "").trim();
   if (!q && !cat_id) return tmapiError(422, "keyword or cat_id is required");
+  const priceRange = normalizePriceRange(price_start, price_end);
+  if (priceRange.error) return tmapiError(422, priceRange.error);
+  price_start = priceRange.priceStart;
+  price_end = priceRange.priceEnd;
   try {
     const auth = await assertAuthLooksValid();
     const proxy = proxyStatus();
@@ -873,30 +1002,49 @@ export async function searchItemsTmapi({
       );
     }
 
-    if (cat_id && !q) {
+    if (cat_id) {
       return getCategoryProducts({
         cat_id,
+        keyword: q || "*",
         page,
         page_size,
         language,
         sort,
+        price_start,
+        price_end,
       });
     }
 
     const raw = await searchOffers(q, {
       page: Math.max(1, Number(page) || 1),
+      pageSize: Math.min(50, Math.max(1, Number(page_size) || 20)),
       lang: normalizeLang(language),
+      sort,
+      priceStart: price_start,
+      priceEnd: price_end,
     });
-    const formatted = toTmapiSearch(raw, {
+    const filteredResults = filterAndSortOffers(raw.results, {
+      price_start,
+      price_end,
+      sort,
+    });
+    const filtered = {
+      ...raw,
+      results: filteredResults,
+      total: raw.total,
+    };
+    const formatted = toTmapiSearch(filtered, {
       keyword: q,
       page: raw.page,
-      page_size: Math.min(20, Math.max(1, Number(page_size) || raw.pageSize || 20)),
+      page_size: Math.min(50, Math.max(1, Number(page_size) || raw.pageSize || 20)),
       sort,
     });
     if (formatted.data.items.length > formatted.data.page_size) {
       formatted.data.items = formatted.data.items.slice(0, formatted.data.page_size);
     }
-    return formatted;
+    return raw.__scraperNoCache || raw.__translationIncomplete
+      ? markResponseUncacheable(formatted)
+      : formatted;
   } catch (err) {
     return tmapiError(500, err.message || "search failed");
   }
@@ -929,14 +1077,18 @@ export async function searchByImage({
     await withLangCookies(context, lang);
     const p = await context.newPage();
     try {
-      const searchUrl =
-        "https://s.1688.com/selloffer/offer_search.htm?keywords=&imageAddress=" +
-        encodeURIComponent(img) +
-        `&beginPage=${pageNo}`;
+      const imageParams = new URLSearchParams({
+        keywords: "",
+        imageAddress: img,
+        beginPage: String(pageNo),
+      });
+      applySearchSort(imageParams, sort);
+      const searchUrl = `https://s.1688.com/selloffer/offer_search.htm?${imageParams}`;
       await p.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
       await p
         .waitForFunction(
           () =>
+            /login\.(?:taobao|1688)\.com|member\/signin/i.test(location.href) ||
             (window.data?.offerV2Showed?.offerList?.length || 0) > 0 ||
             document.querySelectorAll("a[href*='offer/']").length > 0,
           null,
@@ -987,16 +1139,21 @@ export async function searchByImage({
         });
       }
 
+      let translatedTitles = null;
       if (lang === "en" && items.length) {
-        const titles = await translateTexts(items.map((i) => i.title));
-        items = items.map((it, i) => ({ ...it, title: titles[i] || it.title }));
+        translatedTitles = await translateTexts(items.map((i) => i.title));
+        items = items.map((it, i) => ({
+          ...it,
+          title: translatedTitles[i] || it.title,
+        }));
       }
 
+      items = filterAndSortOffers(items, { sort });
       const sliced = items.slice(0, size);
       if (!sliced.length) {
         return tmapiError(502, "Image search returned no products");
       }
-      return toTmapiSearch(
+      return markIfTranslationIncomplete(toTmapiSearch(
         { results: sliced, total: items.length },
         {
           keyword: "[image]",
@@ -1004,7 +1161,7 @@ export async function searchByImage({
           page_size: size,
           sort,
         }
-      );
+      ), translatedTitles);
     } finally {
       await p.close().catch(() => {});
     }
@@ -1035,7 +1192,7 @@ export async function searchFactories({
   const size = Math.min(20, Math.max(1, Number(page_size) || 20));
 
   try {
-    const raw = await searchOffers(q, { page: pageNo, lang });
+    const raw = await searchOffers(q, { page: pageNo, lang, sort });
     const byKey = new Map();
     for (const it of raw.results || []) {
       const key = it.company || it.login_id || it.offerId;
@@ -1057,8 +1214,7 @@ export async function searchFactories({
     const all = [...byKey.values()];
     // enrich from desktop offer objects if present via another scrape pass is too heavy;
     // titles already translated when lang=en by searchOffers
-    void sort;
-    return tmapiOk({
+    const response = tmapiOk({
       page: pageNo,
       page_size: size,
       total_count: String(all.length),
@@ -1066,6 +1222,9 @@ export async function searchFactories({
       sort,
       items: all.slice(0, size),
     });
+    return raw.__scraperNoCache || raw.__translationIncomplete
+      ? markResponseUncacheable(response)
+      : response;
   } catch (err) {
     return tmapiError(500, err.message || "factory search failed");
   }
@@ -1110,6 +1269,7 @@ export async function getCategoryInfo({ cat_id = "", language = "zh" } = {}) {
       await page
         .waitForFunction(
           () =>
+            /login\.(?:taobao|1688)\.com|member\/signin/i.test(location.href) ||
             Boolean(window.data) ||
             document.querySelectorAll("a[href*='categoryId=']").length > 0,
           null,
@@ -1166,15 +1326,16 @@ export async function getCategoryInfo({ cat_id = "", language = "zh" } = {}) {
         };
       }, cat);
 
+      let translatedNames = null;
       if (lang === "en" && info.children?.length) {
-        const names = await translateTexts(info.children.map((c) => c.name));
+        translatedNames = await translateTexts(info.children.map((c) => c.name));
         info.children = info.children.map((c, i) => ({
           ...c,
-          name: names[i] || c.name,
+          name: translatedNames[i] || c.name,
         }));
       }
 
-      return tmapiOk(info);
+      return markIfTranslationIncomplete(tmapiOk(info), translatedNames);
     } finally {
       await page.close().catch(() => {});
     }
@@ -1186,6 +1347,188 @@ export async function getCategoryInfo({ cat_id = "", language = "zh" } = {}) {
   }
 }
 
+const CATEGORY_MERGE_TTL_MS = Math.max(
+  30_000,
+  Number(process.env.CATEGORY_MERGE_TTL_MS) || 2 * 60 * 1000
+);
+const CATEGORY_MERGE_MAX_STATES = Math.max(
+  4,
+  Math.min(100, Number(process.env.CATEGORY_MERGE_MAX_STATES) || 24)
+);
+const CATEGORY_MERGE_MAX_RESULTS = Math.max(
+  100,
+  Math.min(5_000, Number(process.env.CATEGORY_MERGE_MAX_RESULTS) || 1_000)
+);
+const CATEGORY_PAGE_CONCURRENCY = Math.max(
+  1,
+  Math.min(4, Number(process.env.CATEGORY_PAGE_CONCURRENCY) || 3)
+);
+const CATEGORY_MAX_UPSTREAM_PAGES = Math.max(
+  3,
+  Math.min(100, Number(process.env.CATEGORY_MAX_UPSTREAM_PAGES) || 30)
+);
+const categoryMergeStates = new Map();
+
+function categoryPaging(page, pageSize) {
+  const pageNo = Number(page);
+  const size = Number(pageSize);
+  if (!Number.isSafeInteger(pageNo) || pageNo < 1) {
+    return { error: "page must be a positive integer" };
+  }
+  if (!Number.isSafeInteger(size) || size < 1 || size > 50) {
+    return { error: "page_size must be an integer between 1 and 50" };
+  }
+  const offset = (pageNo - 1) * size;
+  if (!Number.isSafeInteger(offset)) return { error: "page is too large" };
+  return { pageNo, size, offset, end: offset + size };
+}
+
+function pruneCategoryMergeStates() {
+  const cutoff = Date.now() - CATEGORY_MERGE_TTL_MS;
+  for (const [key, state] of categoryMergeStates) {
+    if (state.lastUsed < cutoff) categoryMergeStates.delete(key);
+  }
+  while (categoryMergeStates.size >= CATEGORY_MERGE_MAX_STATES) {
+    const oldest = [...categoryMergeStates.entries()].sort(
+      (left, right) => left[1].lastUsed - right[1].lastUsed
+    )[0];
+    if (!oldest) break;
+    categoryMergeStates.delete(oldest[0]);
+  }
+}
+
+function categoryMergeState(key, categories) {
+  pruneCategoryMergeStates();
+  let state = categoryMergeStates.get(key);
+  if (!state) {
+    state = {
+      lastUsed: Date.now(),
+      lock: Promise.resolve(),
+      streams: categories.map((categoryId) => ({
+        categoryId,
+        nextPage: 1,
+        loadedPages: 0,
+        total: null,
+        items: [],
+        cursor: 0,
+        exhausted: false,
+        rawIds: new Set(),
+        sourceIds: new Set(),
+      })),
+      nextStream: 0,
+      seen: new Map(),
+      merged: [],
+      rejected: 0,
+      duplicates: 0,
+      exhausted: false,
+    };
+    categoryMergeStates.set(key, state);
+  }
+  state.lastUsed = Date.now();
+  return state;
+}
+
+async function withCategoryStateLock(state, task) {
+  const previous = state.lock;
+  let unlock;
+  state.lock = new Promise((resolve) => {
+    unlock = resolve;
+  });
+  const predecessor = previous.catch(() => {});
+  const signal = currentJobSignal();
+  let onAbort;
+  try {
+    if (signal?.aborted) throw jobAbortError(signal);
+    if (signal) {
+      await Promise.race([
+        predecessor,
+        new Promise((_, reject) => {
+          onAbort = () => reject(jobAbortError(signal));
+          signal.addEventListener("abort", onAbort, { once: true });
+        }),
+      ]);
+    } else {
+      await predecessor;
+    }
+  } catch (error) {
+    // Preserve the lock chain for later callers without keeping this cancelled
+    // request inside the scarce scrape queue.
+    void predecessor.finally(unlock);
+    throw error;
+  } finally {
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
+  }
+  try {
+    return await task();
+  } finally {
+    unlock();
+  }
+}
+
+async function mapWithLimit(values, limit, mapper) {
+  const output = new Array(values.length);
+  let cursor = 0;
+  const worker = async () => {
+    for (;;) {
+      const index = cursor++;
+      if (index >= values.length) return;
+      output[index] = await mapper(values[index], index);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, values.length) }, () => worker())
+  );
+  return output;
+}
+
+export async function __extendCategoryMergeState(state, target, loadNeeded) {
+  while (state.merged.length < target && !state.exhausted) {
+    const needingData = state.streams.filter(
+      (stream) => !stream.exhausted && stream.cursor >= stream.items.length
+    );
+    if (needingData.length) await loadNeeded(needingData);
+
+    let progressed = false;
+    for (let checked = 0; checked < state.streams.length; checked += 1) {
+      const index = state.nextStream;
+      state.nextStream = (state.nextStream + 1) % state.streams.length;
+      const stream = state.streams[index];
+      if (stream.cursor >= stream.items.length) continue;
+      progressed = true;
+      const item = stream.items[stream.cursor++];
+      const offerId = String(item.offerId || item.item_id || "");
+      if (!offerId) continue;
+      const existing = state.seen.get(offerId);
+      if (existing) {
+        state.duplicates += 1;
+        const knownPaths = new Set(
+          (existing.category_path || []).map((node) => String(node.cat_id || node.id))
+        );
+        for (const node of item.category_path || []) {
+          const nodeId = String(node.cat_id || node.id);
+          if (!knownPaths.has(nodeId)) {
+            existing.category_path.push(node);
+            knownPaths.add(nodeId);
+          }
+        }
+        continue;
+      }
+      state.seen.set(offerId, item);
+      state.merged.push(item);
+      if (state.merged.length >= target) break;
+    }
+
+    state.exhausted = state.streams.every(
+      (stream) => stream.exhausted && stream.cursor >= stream.items.length
+    );
+    if (!progressed && !state.exhausted) {
+      const canLoad = state.streams.some((stream) => !stream.exhausted);
+      if (!canLoad) state.exhausted = true;
+    }
+    if (!progressed && state.exhausted) break;
+  }
+}
+
 /** GET /1688/category/products[+ /v2] */
 export async function getCategoryProducts({
   cat_id,
@@ -1194,108 +1537,277 @@ export async function getCategoryProducts({
   page_size = 20,
   language = "zh",
   sort = "default",
+  price_start = "",
+  price_end = "",
 } = {}) {
-  const cat = String(cat_id || "").trim();
-  if (!cat && !keyword) {
+  const categories = [...new Set(
+    String(cat_id || "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean)
+  )].sort((left, right) => left.localeCompare(right, "en", { numeric: true }));
+  if (categories.some((value) => !/^\d+$/.test(value))) {
+    return tmapiError(422, "cat_id/cat_ids must contain numeric category ids");
+  }
+  if (categories.length > 5) {
+    return tmapiError(422, "At most 5 category ids can be searched together");
+  }
+  const cat = categories.join(",");
+  if (!categories.length && !keyword) {
     return tmapiError(422, "cat_id or keyword is required");
   }
-  const lang = normalizeLang(language);
-  const pageNo = Math.max(1, Number(page) || 1);
-  const size = Math.min(20, Math.max(1, Number(page_size) || 20));
-
-  if (!cat) {
-    return searchItemsTmapi({ keyword, page, page_size, sort, language });
+  if (categories.length > 1 && normalizeSort(sort) !== "default") {
+    return tmapiError(
+      422,
+      "Multi-category search currently supports sort=default; use the fallback provider for global sorted unions"
+    );
   }
+  const lang = normalizeLang(language);
+  const paging = categoryPaging(page, page_size);
+  if (paging.error) return tmapiError(422, paging.error);
+  const { pageNo, size, offset: globalOffset, end: globalEnd } = paging;
+  const needsUniqueLookahead = categories.length > 1;
+  if (globalEnd + (needsUniqueLookahead ? 1 : 0) > CATEGORY_MERGE_MAX_RESULTS) {
+    return tmapiError(
+      422,
+      `Category pagination is limited to the first ${CATEGORY_MERGE_MAX_RESULTS} unique results; use the fallback provider for deeper pages`
+    );
+  }
+  const priceRange = normalizePriceRange(price_start, price_end);
+  if (priceRange.error) return tmapiError(422, priceRange.error);
+  price_start = priceRange.priceStart;
+  price_end = priceRange.priceEnd;
 
-  const browser = await acquirePooledBrowser();
-  let context = null;
-  try {
-    context = await newAuthedContext(browser, {
-      locale: lang === "en" ? "en-US" : "zh-CN",
-      viewport: { width: 1440, height: 900 },
+  if (!categories.length) {
+    return searchItemsTmapi({
+      keyword,
+      page,
+      page_size,
+      sort,
+      language,
+      price_start,
+      price_end,
     });
-    await withLangCookies(context, lang);
-    const page = await context.newPage();
-    try {
-      const kw = keyword && keyword !== "*" ? keyword : "*";
-      const params = new URLSearchParams({
-        keywords: kw,
-        filt: "y",
-        n: "y",
-        categoryId: cat,
-        beginPage: String(pageNo),
-      });
-      applySearchSort(params, sort);
-      const url = `https://s.1688.com/selloffer/offer_search.htm?${params}`;
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-      assertNotLoginPage(page, "category products");
-      await page
-        .waitForFunction(
-          () => (window.data?.offerV2Showed?.offerList?.length || 0) > 0,
-          null,
-          { timeout: 8_000 }
-        )
-        .catch(() => {});
-      assertNotLoginPage(page, "category products");
+  }
+  const kw = keyword && keyword !== "*" ? String(keyword).trim() : "*";
+  const normalizedSort = normalizeSort(sort);
+  const stateKey = JSON.stringify([
+    categories,
+    kw,
+    normalizedSort,
+    price_start,
+    price_end,
+    lang,
+  ]);
+  const state = categoryMergeState(stateKey, categories);
 
-      let items = await page.evaluate(() => {
-        const list = window.data?.offerV2Showed?.offerList || [];
-        return list.map((it) => ({
-          offerId: String(it.offerId || ""),
-          title: String(it.title || "").replace(/<[^>]+>/g, ""),
-          price: it.priceInfo?.price || it.price || null,
-          image: it.offerPicUrl || null,
-          company: it.companyName || null,
-          sales: it.bookedCount != null ? String(it.bookedCount) : null,
-          location: [it.province, it.city].filter(Boolean).join("") || null,
-          member_id: it.sellerMemberId || "",
-          login_id: it.loginId || "",
-          isAd: it.isBid === "true",
-        }));
-      });
+  try {
+    await withCategoryStateLock(state, async () => {
+      const target = globalEnd + (needsUniqueLookahead ? 1 : 0);
+      if (state.merged.length >= target || state.exhausted) return;
 
-      const total =
-        (await page.evaluate(
-          () =>
-            Number(
-              window.data?.offerresultData?.data?.totalCount ||
-                window.data?.abResultData?.totalCount ||
-                0
-            ) || null
-        )) || items.length;
+      const browser = await acquirePooledBrowser();
+      let context = null;
+      try {
+        context = await newAuthedContext(browser, {
+          locale: lang === "en" ? "en-US" : "zh-CN",
+          viewport: { width: 1440, height: 900 },
+        });
+        await withLangCookies(context, lang);
 
-      if (!items.length) {
-        return tmapiError(502, "No category products were extracted from 1688");
+        const scrapeCategoryPage = async (stream) => {
+          if (stream.loadedPages >= CATEGORY_MAX_UPSTREAM_PAGES) {
+            const error = new Error(
+              "Category merge exceeded its bounded upstream-page budget"
+            );
+            error.tmapiCode = 422;
+            throw error;
+          }
+          const upstreamPage = stream.nextPage;
+          const categoryPage = await context.newPage();
+          try {
+            const params = new URLSearchParams({
+              keywords: kw,
+              filt: "y",
+              n: "y",
+              categoryId: stream.categoryId,
+              beginPage: String(upstreamPage),
+              pageSize: "50",
+            });
+            if (price_start !== "") params.set("priceStart", price_start);
+            if (price_end !== "") params.set("priceEnd", price_end);
+            applySearchSort(params, normalizedSort);
+            await categoryPage.goto(
+              `https://s.1688.com/selloffer/offer_search.htm?${params}`,
+              { waitUntil: "domcontentloaded", timeout: 30_000 }
+            );
+            assertNotLoginPage(categoryPage, "category products");
+            const searchReady = await categoryPage
+              .waitForFunction(
+                () =>
+                  /login\.(?:taobao|1688)\.com|member\/signin/i.test(location.href) ||
+                  Boolean(window.data?.offerV2Showed) ||
+                  Boolean(window.data?.offerresultData),
+                null,
+                { timeout: 8_000 }
+              )
+              .then(() => true)
+              .catch(() => false);
+            assertNotLoginPage(categoryPage, "category products");
+            if (!searchReady) {
+              throw new Error(
+                "1688 category search did not expose a ready result payload"
+              );
+            }
+
+            const batch = await categoryPage.evaluate(() => {
+              const data = window.data || {};
+              const list = data.offerV2Showed?.offerList || [];
+              const totalValue =
+                data.offerresultData?.data?.totalCount ??
+                data.abResultData?.totalCount ??
+                null;
+              const pageSizeValue =
+                data.offerresultData?.data?.pageSize ??
+                data.abResultData?.pageSize ??
+                null;
+              return {
+                total:
+                  totalValue != null && Number.isFinite(Number(totalValue))
+                    ? Number(totalValue)
+                    : null,
+                reportedPageSize:
+                  pageSizeValue != null && Number.isFinite(Number(pageSizeValue))
+                    ? Number(pageSizeValue)
+                    : null,
+                items: list.map((it) => ({
+                  offerId: String(it.offerId || ""),
+                  title: String(it.title || "").replace(/<[^>]+>/g, ""),
+                  price: it.priceInfo?.price || it.price || null,
+                  image: it.offerPicUrl || null,
+                  company: it.companyName || null,
+                  sales: it.bookedCount != null ? String(it.bookedCount) : null,
+                  location: [it.province, it.city].filter(Boolean).join("") || null,
+                  member_id: it.sellerMemberId || "",
+                  login_id: it.loginId || "",
+                  source_category_id: String(
+                    it.categoryId || it.leafCategoryId || it.postCategoryId || ""
+                  ),
+                  isAd: it.isBid === "true",
+                })),
+              };
+            });
+            stream.nextPage = upstreamPage + 1;
+            stream.loadedPages += 1;
+
+            if (batch.total != null) stream.total = batch.total;
+            const rawItems = batch.items.filter((item) => item.offerId);
+            const accepted = filterAndSortOffers(rawItems, {
+              price_start,
+              price_end,
+              sort: "default",
+            });
+            const acceptedIds = new Set(accepted.map((item) => item.offerId));
+            state.rejected += rawItems.filter(
+              (item) => !acceptedIds.has(item.offerId)
+            ).length;
+
+            let sourceNew = 0;
+            for (const item of rawItems) {
+              if (stream.sourceIds.has(item.offerId)) continue;
+              stream.sourceIds.add(item.offerId);
+              sourceNew += 1;
+            }
+            const categoryName = knownCategory(stream.categoryId)?.name || "";
+            for (const item of accepted) {
+              if (stream.rawIds.has(item.offerId)) continue;
+              stream.rawIds.add(item.offerId);
+              stream.items.push({
+                ...item,
+                category_path: [
+                  {
+                    id: stream.categoryId,
+                    cat_id: stream.categoryId,
+                    name: categoryName,
+                  },
+                  ...(item.source_category_id &&
+                  item.source_category_id !== stream.categoryId
+                    ? [
+                        {
+                          id: item.source_category_id,
+                          cat_id: item.source_category_id,
+                          name: "",
+                        },
+                      ]
+                    : []),
+                ],
+              });
+            }
+
+            const rawCount = rawItems.length;
+            const stride = batch.reportedPageSize || (upstreamPage === 1 ? rawCount : 0);
+            if (
+              rawCount === 0 ||
+              sourceNew === 0 ||
+              (stream.total != null && stream.sourceIds.size >= stream.total) ||
+              (stride > 0 && rawCount < stride)
+            ) {
+              stream.exhausted = true;
+            }
+          } finally {
+            await categoryPage.close().catch(() => {});
+          }
+        };
+
+        await __extendCategoryMergeState(state, target, (streams) =>
+          mapWithLimit(streams, CATEGORY_PAGE_CONCURRENCY, scrapeCategoryPage)
+        );
+      } finally {
+        if (context) await context.close().catch(() => {});
+        releaseBrowser(browser);
       }
+    });
 
-      const categoryName = knownCategory(cat)?.name || "";
-      items = items.map((item) => ({
+    let items = state.merged
+      .slice(globalOffset, globalEnd)
+      .map((item) => ({ ...item, category_path: [...(item.category_path || [])] }));
+    let translatedTitles = null;
+    if (lang === "en" && items.length) {
+      translatedTitles = await translateTexts(items.map((item) => item.title));
+      items = items.map((item, index) => ({
         ...item,
-        category_path: [{ id: cat, cat_id: cat, name: categoryName }],
+        title: translatedTitles[index] || item.title,
       }));
-
-      if (lang === "en" && items.length) {
-        const titles = await translateTexts(items.map((i) => i.title));
-        items = items.map((it, i) => ({ ...it, title: titles[i] || it.title }));
-      }
-
-      return toTmapiSearch(
-        { results: items.slice(0, size), total },
-        {
-          keyword: kw === "*" ? `[cat:${cat}]` : kw,
-          page: pageNo,
-          page_size: size,
-          sort,
-        }
-      );
-    } finally {
-      await page.close().catch(() => {});
     }
+
+    const estimatedTotal = state.streams.reduce(
+      (sum, stream) => sum + Math.max(0, Number(stream.total || 0)),
+      0
+    );
+    const totalIsExact = state.exhausted;
+    const reportedTotal = totalIsExact
+      ? state.merged.length
+      : Math.max(estimatedTotal, state.merged.length);
+    const formatted = toTmapiSearch(
+      { results: items, total: reportedTotal },
+      {
+        keyword: kw === "*" ? `[cat:${cat}]` : kw,
+        page: pageNo,
+        page_size: size,
+        sort: normalizedSort,
+      }
+    );
+    const onlyStream = state.streams.length === 1 ? state.streams[0] : null;
+    formatted.data.has_next_page = onlyStream
+      ? onlyStream.total != null
+        ? globalEnd < onlyStream.total
+        : state.merged.length > globalEnd || !state.exhausted
+      : state.merged.length > globalEnd;
+    formatted.data.total_is_exact = totalIsExact;
+    if (!totalIsExact) formatted.data.estimated_total = reportedTotal;
+    return markIfTranslationIncomplete(formatted, translatedTitles);
   } catch (err) {
-    return tmapiError(500, err.message || "category products failed");
-  } finally {
-    if (context) await context.close().catch(() => {});
-    releaseBrowser(browser);
+    return tmapiError(err?.tmapiCode || 500, err.message || "category products failed");
   }
 }
 

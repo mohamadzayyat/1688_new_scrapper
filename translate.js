@@ -3,6 +3,8 @@
  * Used for search result titles when 1688 page translation is incomplete.
  */
 
+import { currentJobSignal } from "./jobContext.js";
+
 const TRANSLATE_TIMEOUT_MS = Math.max(
   1_000,
   Number(process.env.TRANSLATE_TIMEOUT_MS) || 5_000
@@ -20,6 +22,7 @@ const TRANSLATE_CACHE_MAX = Math.max(
   Number(process.env.TRANSLATE_CACHE_MAX) || 5_000
 );
 const translationCache = new Map();
+const HAN_CHARACTER = /[\u3400-\u4dbf\u4e00-\u9fff]/g;
 
 function stripHtml(value) {
   return String(value || "")
@@ -38,6 +41,10 @@ async function translateChunk(text, { from = "zh-CN", to = "en" } = {}) {
     encodeURIComponent(text);
 
   const controller = new AbortController();
+  const jobSignal = currentJobSignal();
+  const abortFromJob = () => controller.abort(jobSignal?.reason);
+  if (jobSignal?.aborted) abortFromJob();
+  else jobSignal?.addEventListener("abort", abortFromJob, { once: true });
   const timer = setTimeout(() => controller.abort(), TRANSLATE_TIMEOUT_MS);
   timer.unref?.();
   let res;
@@ -45,11 +52,49 @@ async function translateChunk(text, { from = "zh-CN", to = "en" } = {}) {
     res = await fetch(url, { signal: controller.signal });
   } finally {
     clearTimeout(timer);
+    jobSignal?.removeEventListener("abort", abortFromJob);
   }
   if (!res.ok) throw new Error(`Translate failed (${res.status})`);
   const data = await res.json();
-  if (!Array.isArray(data?.[0])) return text;
-  return data[0].map((part) => part?.[0] || "").join("");
+  if (!Array.isArray(data?.[0]) || data[0].length === 0) {
+    throw new Error("Translate returned a malformed payload");
+  }
+  const translated = data[0].map((part) => part?.[0] || "").join("").trim();
+  if (!translated) throw new Error("Translate returned an empty result");
+  return translated;
+}
+
+function hanCount(value) {
+  return String(value || "").match(HAN_CHARACTER)?.length || 0;
+}
+
+function translationLooksComplete(original, translated) {
+  const source = stripHtml(original);
+  const result = stripHtml(translated);
+  if (!result) return false;
+  const sourceHan = hanCount(source);
+  if (!sourceHan) return true;
+  // A successful English translation should change Chinese source text and
+  // materially reduce its Han characters. Otherwise serve the source as a
+  // fallback, but never cache it as a completed translation.
+  return result !== source && hanCount(result) < sourceHan;
+}
+
+export function markResponseUncacheable(response) {
+  if (!response || typeof response !== "object") return response;
+  Object.defineProperty(response, "__scraperNoCache", {
+    value: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return response;
+}
+
+export function markIfTranslationIncomplete(response, translated) {
+  return translated?.__translationComplete === false ||
+    translated?.__translationIncomplete
+    ? markResponseUncacheable(response)
+    : response;
 }
 
 function translationCacheKey(text, from, to) {
@@ -106,6 +151,7 @@ export async function translateTexts(texts, { from = "zh-CN", to = "en" } = {}) 
   // Translate unique strings in bounded parallel batches. Validate the output
   // cardinality so a changed newline cannot shift translations onto fields.
   const unique = [...indexesByText.keys()];
+  let complete = true;
   const batches = [];
   for (let start = 0; start < unique.length; start += 8) {
     batches.push(unique.slice(start, start + 8));
@@ -113,13 +159,23 @@ export async function translateTexts(texts, { from = "zh-CN", to = "en" } = {}) 
   let cursor = 0;
   const worker = async () => {
     for (;;) {
+      if (currentJobSignal()?.aborted) {
+        complete = false;
+        return;
+      }
       const batchIndex = cursor++;
       if (batchIndex >= batches.length) return;
       const batch = batches[batchIndex];
       try {
         const translated = await translateChunk(batch.join("\n"), { from, to });
         const parts = translated.split("\n");
-        if (parts.length !== batch.length) continue;
+        if (
+          parts.length !== batch.length ||
+          parts.some((part, index) => !translationLooksComplete(batch[index], part))
+        ) {
+          complete = false;
+          continue;
+        }
         batch.forEach((original, partIndex) => {
           const value = (parts[partIndex] || original).trim();
           setCachedTranslation(original, value, from, to);
@@ -129,6 +185,7 @@ export async function translateTexts(texts, { from = "zh-CN", to = "en" } = {}) 
         });
       } catch {
         // Leave the original text on timeout/upstream failure.
+        complete = false;
       }
     }
   };
@@ -139,6 +196,10 @@ export async function translateTexts(texts, { from = "zh-CN", to = "en" } = {}) 
     )
   );
 
+  Object.defineProperty(out, "__translationComplete", {
+    value: complete,
+    enumerable: false,
+  });
   return out;
 }
 
@@ -205,6 +266,12 @@ export async function translateItemDetailData(data) {
 
   if (!texts.length) return data;
   const translated = await translateTexts(texts);
+  if (translated.__translationComplete === false) {
+    Object.defineProperty(data, "__translationIncomplete", {
+      value: true,
+      enumerable: false,
+    });
+  }
   for (const fn of apply) fn(translated);
 
   if (propPairs.length) {

@@ -2,7 +2,15 @@
  * In-process + optional disk TTL cache.
  * Supports stale-while-revalidate so hot paths stay under 1s.
  */
-import { mkdir, readFile, writeFile, unlink, rename } from "node:fs/promises";
+import {
+  mkdir,
+  readFile,
+  writeFile,
+  unlink,
+  rename,
+  readdir,
+  stat,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
@@ -17,15 +25,75 @@ const DISK_DIR =
   process.env.CACHE_DIR ||
   join(fileURLToPath(new URL(".", import.meta.url)), ".cache");
 const DISK_ENABLED = String(process.env.DISK_CACHE || "1") !== "0";
-const CACHE_VERSION = process.env.CACHE_VERSION || "v3";
+const CACHE_VERSION = process.env.CACHE_VERSION || "v4";
+const DISK_MAX_FILES = Math.max(
+  100,
+  Number(process.env.DISK_CACHE_MAX_FILES) || 5_000
+);
+const DISK_MAX_BYTES = Math.max(
+  10 * 1024 * 1024,
+  Number(process.env.DISK_CACHE_MAX_BYTES) || 512 * 1024 * 1024
+);
+const DISK_MAX_AGE_MS = Math.max(
+  DISK_TTL_MS,
+  Number(process.env.DISK_CACHE_MAX_AGE_MS) || 24 * 60 * 60 * 1000
+);
+const DISK_PRUNE_INTERVAL_MS = Math.max(
+  10_000,
+  Number(process.env.DISK_CACHE_PRUNE_INTERVAL_MS) || 60_000
+);
+const DISK_TEMP_MAX_AGE_MS = Math.max(
+  60_000,
+  Number(process.env.DISK_CACHE_TEMP_MAX_AGE_MS) || 10 * 60 * 1000
+);
 
 const store = new Map(); // key -> { expires, staleUntil, value }
-const inflight = new Map(); // key -> Promise (singleflight)
+const inflight = new Map(); // key -> { promise, controller, subscribers, ... }
 let hits = 0;
 let misses = 0;
 let staleHits = 0;
 let diskHits = 0;
 let refreshFailures = 0;
+let diskPrunedFiles = 0;
+let lastDiskPrune = 0;
+let diskPrunePromise = null;
+const pendingDiskWrites = new Set();
+
+function markCacheResult(value, status) {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) {
+    return value;
+  }
+  try {
+    Object.defineProperty(value, "__scraperCache", {
+      value: status,
+      configurable: true,
+      enumerable: false,
+    });
+  } catch {
+    // Cache metadata is diagnostic only.
+  }
+  return value;
+}
+
+function cacheMetadata(value) {
+  return value?.__scraperPath
+    ? { scraperPath: String(value.__scraperPath) }
+    : undefined;
+}
+
+function restoreCacheMetadata(value, metadata) {
+  if (!value || typeof value !== "object" || !metadata?.scraperPath) return value;
+  try {
+    Object.defineProperty(value, "__scraperPath", {
+      value: String(metadata.scraperPath),
+      configurable: true,
+      enumerable: false,
+    });
+  } catch {
+    // Diagnostic metadata must never break a usable cache entry.
+  }
+  return value;
+}
 
 function now() {
   return Date.now();
@@ -52,6 +120,7 @@ export function cacheKey(parts) {
 }
 
 function isCacheableValue(value) {
+  if (value?.__scraperNoCache) return false;
   if (!value || Number(value.code) !== 200 || value.data == null) return false;
   if (!value.data || typeof value.data !== "object" || Array.isArray(value.data)) {
     return true;
@@ -83,7 +152,7 @@ export function cacheGet(key) {
     return null;
   }
   hits += 1;
-  return row.value;
+  return markCacheResult(row.value, "memory");
 }
 
 /**
@@ -100,10 +169,10 @@ export function cacheGetFreshOrStale(key) {
   }
   if (row.expires > t) {
     hits += 1;
-    return { value: row.value, fresh: true };
+    return { value: markCacheResult(row.value, "memory"), fresh: true };
   }
   staleHits += 1;
-  return { value: row.value, fresh: false };
+  return { value: markCacheResult(row.value, "stale"), fresh: false };
 }
 
 export function cacheSet(key, value, ttlMs = DEFAULT_TTL_MS) {
@@ -116,27 +185,124 @@ export function cacheSet(key, value, ttlMs = DEFAULT_TTL_MS) {
   });
   evictIfNeeded();
   if (DISK_ENABLED) {
-    void persistDisk(key, value, freshFor, keepStaleFor);
+    const write = persistDisk(key, value, freshFor, keepStaleFor);
+    pendingDiskWrites.add(write);
+    void write.then(
+      () => pendingDiskWrites.delete(write),
+      () => pendingDiskWrites.delete(write)
+    );
+  }
+}
+
+export async function flushDiskCacheWrites() {
+  while (pendingDiskWrites.size) {
+    await Promise.allSettled([...pendingDiskWrites]);
   }
 }
 
 async function persistDisk(key, value, freshFor, keepStaleFor) {
+  let temporary = null;
   try {
     await mkdir(DISK_DIR, { recursive: true });
+    // Free expired entries before a write so a full cache directory can recover.
+    await scheduleDiskPrune();
     const writtenAt = now();
     const payload = {
       key,
       freshUntil: writtenAt + freshFor,
       staleUntil: writtenAt + keepStaleFor,
       value,
+      metadata: cacheMetadata(value),
     };
     const target = diskPath(key);
-    const temporary = `${target}.${process.pid}.${writtenAt}.tmp`;
+    temporary = `${target}.${process.pid}.${writtenAt}.tmp`;
     await writeFile(temporary, JSON.stringify(payload), "utf8");
     await rename(temporary, target);
-  } catch {
+    temporary = null;
+  } catch (error) {
     // disk cache is best-effort
+    if (temporary) await unlink(temporary).catch(() => {});
+    if (["ENOSPC", "EDQUOT"].includes(error?.code)) {
+      // If the filesystem itself is full, configured cache limits may not yet
+      // be exceeded. Drop the oldest cache slice so the next write can recover.
+      await pruneDiskCache({ emergency: true }).catch(() => {});
+    } else {
+      await scheduleDiskPrune({ force: true });
+    }
+  } finally {
+    void scheduleDiskPrune();
   }
+}
+
+export async function pruneDiskCache({ emergency = false } = {}) {
+  if (!DISK_ENABLED) return { removed: 0, files: 0, bytes: 0 };
+  await mkdir(DISK_DIR, { recursive: true });
+  const names = (await readdir(DISK_DIR)).filter(
+    (name) => name.endsWith(".json") || name.endsWith(".tmp")
+  );
+  const files = (
+    await Promise.all(
+      names.map(async (name) => {
+        try {
+          const info = await stat(join(DISK_DIR, name));
+          return {
+            name,
+            path: join(DISK_DIR, name),
+            size: info.size,
+            mtimeMs: info.mtimeMs,
+            temporary: name.endsWith(".tmp"),
+          };
+        } catch {
+          return null;
+        }
+      })
+    )
+  ).filter(Boolean);
+  files.sort((left, right) => left.mtimeMs - right.mtimeMs);
+
+  const cutoff = now() - DISK_MAX_AGE_MS;
+  const temporaryCutoff = now() - DISK_TEMP_MAX_AGE_MS;
+  let bytes = files.reduce((sum, file) => sum + file.size, 0);
+  let remaining = files.length;
+  let removed = 0;
+  let emergencyRemaining = emergency
+    ? Math.max(1, Math.ceil(files.filter((file) => !file.temporary).length * 0.1))
+    : 0;
+  for (const file of files) {
+    const overLimit = remaining > DISK_MAX_FILES || bytes > DISK_MAX_BYTES;
+    const expired = file.temporary
+      ? file.mtimeMs < temporaryCutoff
+      : file.mtimeMs < cutoff;
+    // Never unlink a fresh temporary file that another write may still own.
+    const emergencyDelete = !file.temporary && emergencyRemaining > 0;
+    if (!expired && !emergencyDelete && (file.temporary || !overLimit)) continue;
+    try {
+      await unlink(file.path);
+      removed += 1;
+      remaining -= 1;
+      bytes -= file.size;
+      if (emergencyDelete) emergencyRemaining -= 1;
+    } catch {
+      // Another cache operation may already have removed the entry.
+    }
+  }
+  diskPrunedFiles += removed;
+  return { removed, files: remaining, bytes: Math.max(0, bytes) };
+}
+
+function scheduleDiskPrune({ force = false } = {}) {
+  if (!DISK_ENABLED) return Promise.resolve(null);
+  if (diskPrunePromise) return diskPrunePromise;
+  if (!force && now() - lastDiskPrune < DISK_PRUNE_INTERVAL_MS) {
+    return Promise.resolve(null);
+  }
+  lastDiskPrune = now();
+  diskPrunePromise = pruneDiskCache()
+    .catch(() => null)
+    .finally(() => {
+      diskPrunePromise = null;
+    });
+  return diskPrunePromise;
 }
 
 async function readDisk(key, { allowStale = false } = {}) {
@@ -155,58 +321,151 @@ async function readDisk(key, { allowStale = false } = {}) {
     const fresh = freshUntil > t;
     if (!fresh && !allowStale) return null;
     diskHits += 1;
+    restoreCacheMetadata(payload.value, payload.metadata);
     store.set(key, {
       value: payload.value,
       expires: freshUntil,
       staleUntil,
     });
-    return { value: payload.value, fresh };
+    evictIfNeeded();
+    scheduleDiskPrune();
+    return {
+      value: markCacheResult(payload.value, fresh ? "disk" : "stale-disk"),
+      fresh,
+    };
   } catch {
     return null;
   }
 }
 
+function cacheAbortError(signal = null) {
+  const reason = signal?.reason;
+  if (
+    reason instanceof Error &&
+    !(reason.name === "AbortError" && reason.constructor?.name === "DOMException")
+  ) {
+    return reason;
+  }
+  const error = new Error("Cache subscriber cancelled");
+  error.name = "AbortError";
+  error.code = 499;
+  error.cancelled = true;
+  return error;
+}
+
+function startInflight(key, task, { background = false } = {}) {
+  const controller = new AbortController();
+  const entry = {
+    controller,
+    subscribers: 0,
+    background,
+    settled: false,
+    promise: null,
+  };
+  entry.promise = Promise.resolve()
+    .then(() => task(controller.signal))
+    .finally(() => {
+      entry.settled = true;
+      if (inflight.get(key) === entry) inflight.delete(key);
+    });
+  inflight.set(key, entry);
+  return entry;
+}
+
+function subscribeInflight(entry, signal) {
+  if (signal?.aborted) {
+    if (entry.subscribers === 0 && !entry.background && !entry.settled) {
+      entry.controller.abort(signal.reason);
+    }
+    return Promise.reject(cacheAbortError(signal));
+  }
+  entry.subscribers += 1;
+  return new Promise((resolve, reject) => {
+    let detached = false;
+    const detach = (cancelled = false) => {
+      if (detached) return;
+      detached = true;
+      signal?.removeEventListener("abort", onAbort);
+      entry.subscribers = Math.max(0, entry.subscribers - 1);
+      if (
+        cancelled &&
+        entry.subscribers === 0 &&
+        !entry.background &&
+        !entry.settled
+      ) {
+        entry.controller.abort(signal?.reason);
+      }
+    };
+    const onAbort = () => {
+      detach(true);
+      reject(cacheAbortError(signal));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    entry.promise.then(
+      (value) => {
+        detach();
+        resolve(value);
+      },
+      (error) => {
+        detach();
+        reject(error);
+      }
+    );
+  });
+}
+
+function liveInflight(key) {
+  const entry = inflight.get(key);
+  return entry && !entry.controller.signal.aborted ? entry : null;
+}
+
 function refreshInBackground(key, ttlMs, producer) {
   if (inflight.has(key)) return;
-  const refresh = Promise.resolve()
-    .then(producer)
-    .then((value) => {
-      if (isCacheableValue(value)) cacheSet(key, value, ttlMs);
-      return value;
-    })
-    .catch((err) => {
-      refreshFailures += 1;
-      console.error(`[cache] background refresh failed: ${err?.message || err}`);
-      return null;
-    })
-    .finally(() => inflight.delete(key));
-  inflight.set(key, refresh);
+  const entry = startInflight(
+    key,
+    async (signal) => {
+      try {
+        const value = await producer(signal);
+        if (signal.aborted) throw cacheAbortError(signal);
+        if (isCacheableValue(value)) cacheSet(key, value, ttlMs);
+        return value;
+      } catch (err) {
+        refreshFailures += 1;
+        console.error(`[cache] background refresh failed: ${err?.message || err}`);
+        return null;
+      }
+    },
+    { background: true }
+  );
+  // Background refreshes deliberately have no HTTP subscriber.
+  void entry.promise;
 }
 
 /**
  * Classic cache-aside (fresh only).
  */
-export async function cached(key, ttlMs, producer) {
+export async function cached(key, ttlMs, producer, { signal } = {}) {
   const hit = cacheGet(key);
   if (hit != null) return hit;
 
-  if (inflight.has(key)) return inflight.get(key);
+  const existing = liveInflight(key);
+  if (existing) return subscribeInflight(existing, signal);
+  if (signal?.aborted) throw cacheAbortError(signal);
 
-  const job = (async () => {
+  const entry = startInflight(key, async (workSignal) => {
     const disk = await readDisk(key);
     if (disk?.fresh) {
       hits += 1;
       return disk.value;
     }
-    const value = await producer();
-    if (isCacheableValue(value)) {
-      cacheSet(key, value, ttlMs);
-    }
+    if (workSignal.aborted) throw cacheAbortError(workSignal);
+    const produced = await producer(workSignal);
+    if (workSignal.aborted) throw cacheAbortError(workSignal);
+    const value = markCacheResult(produced, "miss");
+    if (isCacheableValue(value)) cacheSet(key, value, ttlMs);
     return value;
-  })().finally(() => inflight.delete(key));
-
-  inflight.set(key, job);
-  return job;
+  });
+  return subscribeInflight(entry, signal);
 }
 
 /**
@@ -215,7 +474,7 @@ export async function cached(key, ttlMs, producer) {
  *
  * Guarantees <1s for any previously seen key.
  */
-export async function cachedSwr(key, ttlMs, producer) {
+export async function cachedSwr(key, ttlMs, producer, { signal } = {}) {
   const mem = cacheGetFreshOrStale(key);
   if (mem?.fresh) return mem.value;
 
@@ -233,17 +492,20 @@ export async function cachedSwr(key, ttlMs, producer) {
     return disk.value;
   }
 
-  if (inflight.has(key)) return inflight.get(key);
+  const existing = liveInflight(key);
+  if (existing) return subscribeInflight(existing, signal);
+  if (signal?.aborted) throw cacheAbortError(signal);
   misses += 1;
 
-  const job = (async () => {
-    const value = await producer();
+  const entry = startInflight(key, async (workSignal) => {
+    if (workSignal.aborted) throw cacheAbortError(workSignal);
+    const produced = await producer(workSignal);
+    if (workSignal.aborted) throw cacheAbortError(workSignal);
+    const value = markCacheResult(produced, "miss");
     if (isCacheableValue(value)) cacheSet(key, value, ttlMs);
     return value;
-  })().finally(() => inflight.delete(key));
-
-  inflight.set(key, job);
-  return job;
+  });
+  return subscribeInflight(entry, signal);
 }
 
 export function cacheStats() {
@@ -253,6 +515,7 @@ export function cacheStats() {
     misses,
     staleHits,
     diskHits,
+    diskPrunedFiles,
     refreshFailures,
     hitRate:
       hits + misses === 0 ? 0 : Number((hits / (hits + misses)).toFixed(3)),
@@ -260,9 +523,14 @@ export function cacheStats() {
     diskTtlMs: DISK_TTL_MS,
     maxEntries: MAX_ENTRIES,
     diskEnabled: DISK_ENABLED,
+    diskMaxFiles: DISK_MAX_FILES,
+    diskMaxBytes: DISK_MAX_BYTES,
   };
 }
 
 export function cacheClear() {
   store.clear();
 }
+
+// Clean crash leftovers and expired entries even before the first cache hit.
+if (DISK_ENABLED) void scheduleDiskPrune({ force: true });
