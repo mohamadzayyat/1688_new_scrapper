@@ -7,11 +7,12 @@
     "1688-scrape": "./cli.js"
   },
   "scripts": {
+    "build": "node -e \"console.log('No compile step — plain Node ESM app')\"",
     "start": "node server.js",
     "scrape": "node cli.js",
     "search": "node cli.js --search",
     "login": "node cli.js --login",
-    "postinstall": "npx playwright install chromium"
+    "postinstall": "npx playwright install --with-deps chromium"
   },
   "engines": {
     "node": ">=18"
