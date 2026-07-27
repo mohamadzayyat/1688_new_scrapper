@@ -21,6 +21,9 @@ import {
   searchItemsCrossBorder,
   searchByImageCrossBorder,
 } from "./extraScrape.js";
+import { enqueueJob, jobQueueStats, recommendedHardware } from "./jobQueue.js";
+import { cacheKey, cached, cacheStats } from "./cache.js";
+import { warmBrowserPool, browserPoolStats } from "./browser.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const PUBLIC_DIR = join(__dirname, "public");
@@ -35,7 +38,8 @@ const MIME = {
   ".ico": "image/x-icon",
 };
 
-let activeJob = null;
+const ITEM_CACHE_TTL = Math.max(10_000, Number(process.env.ITEM_CACHE_TTL_MS) || 120_000);
+const SEARCH_CACHE_TTL = Math.max(5_000, Number(process.env.SEARCH_CACHE_TTL_MS) || 60_000);
 
 function sendJson(res, status, body) {
   const payload = JSON.stringify(body, null, 2);
@@ -72,25 +76,28 @@ async function serveStatic(req, res) {
   }
 }
 
-async function withJob(res, label, fn, { tmapi = true } = {}) {
-  if (activeJob) {
-    const body = tmapi
-      ? tmapiError(439, "A scrape is already running. Wait for it to finish.")
-      : { error: "A scrape is already running. Wait for it to finish." };
-    if (tmapi) sendTmapi(res, body);
-    else sendJson(res, 429, body);
-    return;
-  }
-  activeJob = label;
+/**
+ * Concurrent job runner (queue) — up to MAX_CONCURRENT scrapes in parallel.
+ * Instant tools (parse/convert) should NOT use this.
+ */
+async function withJob(res, label, fn, { tmapi = true, cacheTtl = 0, cacheParts = null } = {}) {
   try {
-    const data = await fn();
+    const run = async () => {
+      if (cacheTtl > 0 && cacheParts) {
+        const key = cacheKey(cacheParts);
+        return cached(key, cacheTtl, fn);
+      }
+      return fn();
+    };
+
+    const data = await enqueueJob(label, run);
     if (tmapi) sendTmapi(res, data);
     else sendJson(res, 200, data);
   } catch (err) {
-    if (tmapi) sendTmapi(res, tmapiError(500, err.message || "Request failed"));
-    else sendJson(res, 502, { error: err.message || "Request failed" });
-  } finally {
-    activeJob = null;
+    const code = err?.code === 439 || err?.queueFull ? 439 : 500;
+    const msg = err.message || "Request failed";
+    if (tmapi) sendTmapi(res, tmapiError(code, msg));
+    else sendJson(res, code === 439 ? 429 : 502, { error: msg });
   }
 }
 
@@ -139,8 +146,19 @@ async function handleItemDetail(req, res) {
     return;
   }
 
-  await withJob(res, `item_detail:${itemId}:${language}`, () =>
-    getItemDetailById(itemId, { language, optimize_title: optimizeTitle })
+  await withJob(
+    res,
+    `item_detail:${itemId}:${language}`,
+    () =>
+      getItemDetailById(itemId, {
+        language,
+        optimize_title: optimizeTitle,
+      }),
+    {
+      tmapi: true,
+      cacheTtl: ITEM_CACHE_TTL,
+      cacheParts: ["item_detail", itemId, language, optimizeTitle],
+    }
   );
 }
 
@@ -167,8 +185,19 @@ async function handleItemDetailByUrl(req, res) {
     );
     return;
   }
-  await withJob(res, `item_detail_by_url:${itemId}:${language}`, () =>
-    getItemDetailById(itemId, { language, optimize_title: optimizeTitle })
+  await withJob(
+    res,
+    `item_detail_by_url:${itemId}:${language}`,
+    () =>
+      getItemDetailById(itemId, {
+        language,
+        optimize_title: optimizeTitle,
+      }),
+    {
+      tmapi: true,
+      cacheTtl: ITEM_CACHE_TTL,
+      cacheParts: ["item_detail", itemId, language, optimizeTitle],
+    }
   );
 }
 
@@ -242,7 +271,12 @@ async function handleSearchItems(req, res) {
     return;
   }
   await withJob(res, `search:${keyword || cat_id}:${page}`, () =>
-    searchItemsTmapi({ keyword, page, page_size, sort, language, cat_id })
+    searchItemsTmapi({ keyword, page, page_size, sort, language, cat_id }),
+    {
+      tmapi: true,
+      cacheTtl: SEARCH_CACHE_TTL,
+      cacheParts: ["search", keyword, cat_id, page, page_size, sort, language],
+    }
   );
 }
 
@@ -587,9 +621,24 @@ const ROUTES = [
   ["/api/search", handleLegacySearch],
 ];
 
+async function handleHealth(_req, res) {
+  sendJson(res, 200, {
+    ok: true,
+    uptimeSec: Math.round(process.uptime()),
+    queue: jobQueueStats(),
+    browsers: browserPoolStats(),
+    cache: cacheStats(),
+    hardware: recommendedHardware(),
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
+    if (url.pathname === "/health" || url.pathname === "/api/health") {
+      await handleHealth(req, res);
+      return;
+    }
     const hit = ROUTES.find(([path]) => url.pathname === path);
     if (hit) {
       await hit[1](req, res);
@@ -601,7 +650,16 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   console.log(`1688 scraper UI → http://localhost:${PORT}`);
+  console.log(`Health → http://localhost:${PORT}/health`);
   console.log(`TMAPI routes mounted under /1688/...`);
+  const hw = recommendedHardware();
+  console.log(
+    `[capacity] maxConcurrent=${hw.maxConcurrent} maxQueue=${hw.maxQueue} (target ~${hw.targetUsers} users)`
+  );
+  console.log(`[hardware] recommend ${hw.suggest.vcpu} vCPU, ${hw.suggest.ramGb} GB RAM`);
+  warmBrowserPool().catch((err) =>
+    console.error(`[pool] warm failed: ${err.message}`)
+  );
 });

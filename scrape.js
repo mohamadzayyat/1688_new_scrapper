@@ -2,8 +2,9 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { launchBrowser } from "./browser.js";
+import { launchBrowser, acquirePooledBrowser, releaseBrowser, newFastContext } from "./browser.js";
 import { toTmapiItemDetail, tmapiError } from "./tmapiFormat.js";
+import { AUTH_PATH, hasSavedAuth } from "./auth.js";
 
 function usage(exitCode = 1) {
   console.error(`Usage:
@@ -332,12 +333,14 @@ export async function getItemDetailById(
   }
 
   const url = `https://detail.1688.com/offer/${offerId}.html`;
-  const browser = await launchBrowser({ headed });
+  const browser = headed
+    ? await launchBrowser({ headed: true })
+    : await acquirePooledBrowser();
 
   try {
-    const context = await browser.newContext({
+    const contextOpts = {
       locale: lang === "en" ? "en-US" : "zh-CN",
-      viewport: { width: 1440, height: 900 },
+      viewport: { width: 1280, height: 800 },
       userAgent:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
       extraHTTPHeaders: {
@@ -346,7 +349,14 @@ export async function getItemDetailById(
             ? "en-US,en;q=0.9,zh-CN;q=0.5"
             : "zh-CN,zh;q=0.9,en;q=0.8",
       },
-    });
+    };
+    if (!headed && (await hasSavedAuth())) {
+      contextOpts.storageState = AUTH_PATH;
+    }
+
+    const context = headed
+      ? await browser.newContext(contextOpts)
+      : await newFastContext(browser, { ...contextOpts, blockAssets: true });
 
     await context.addCookies([
       {
@@ -360,68 +370,78 @@ export async function getItemDetailById(
     const page = await context.newPage();
     let lastError;
 
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-        await waitForOfferData(page, 90_000);
-        if (lang === "en") {
-          await waitForEnglishTranslation(page);
-        }
-        // Product attributes render below the fold / lazily
-        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight * 0.45));
-        await page
-          .waitForFunction(
-            () =>
-              /全部参数|商品参数|Product Attributes/.test(
-                document.body?.innerText || ""
-              ) || /材质[\s\S]{0,80}(记忆棉|涤棉|品牌)/.test(document.body?.innerText || ""),
-            null,
-            { timeout: 15_000 }
-          )
-          .catch(() => {});
-        // Expand full attribute panel when present
-        await page
-          .evaluate(() => {
-            const nodes = Array.from(document.querySelectorAll("a,button,span,div"));
-            const btn = nodes.find((el) =>
-              /全部参数|查看全部参数|Product Attributes/.test(
-                (el.textContent || "").trim()
-              )
-            );
-            if (btn) btn.click();
-          })
-          .catch(() => {});
-        await sleep(1200);
+    try {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          await page.goto(url, {
+            waitUntil: "domcontentloaded",
+            timeout: 45_000,
+          });
+          await waitForOfferData(page, 35_000);
+          if (lang === "en") {
+            await waitForEnglishTranslation(page, 12_000);
+          }
+          await page.evaluate(() =>
+            window.scrollTo(0, document.body.scrollHeight * 0.4)
+          );
+          await page
+            .waitForFunction(
+              () =>
+                /全部参数|商品参数|Product Attributes|材质|品牌/.test(
+                  document.body?.innerText || ""
+                ),
+              null,
+              { timeout: 6_000 }
+            )
+            .catch(() => {});
+          await page
+            .evaluate(() => {
+              const nodes = Array.from(
+                document.querySelectorAll("a,button,span,div")
+              );
+              const btn = nodes.find((el) =>
+                /全部参数|查看全部参数|Product Attributes/.test(
+                  (el.textContent || "").trim()
+                )
+              );
+              if (btn) btn.click();
+            })
+            .catch(() => {});
+          await sleep(350);
 
-        const raw = await extractRawOffer(page, offerId);
-        if (!raw.title && !raw.skuModel && !raw.mainPrice) {
-          throw new Error("Could not find product data on the page");
-        }
+          const raw = await extractRawOffer(page, offerId);
+          if (!raw.title && !raw.skuModel && !raw.mainPrice) {
+            throw new Error("Could not find product data on the page");
+          }
 
-        // optional title cleanup for translators
-        if (optimize_title && lang === "zh" && raw.title) {
-          raw.title = String(raw.title)
-            .replace(/\s+/g, " ")
-            .replace(/(批发|厂家|直销|包邮)/g, "")
-            .trim();
-        }
+          if (optimize_title && lang === "zh" && raw.title) {
+            raw.title = String(raw.title)
+              .replace(/\s+/g, " ")
+              .replace(/(批发|厂家|直销|包邮)/g, "")
+              .trim();
+          }
 
-        const result = toTmapiItemDetail(raw);
-        const durationSeconds = Number(((Date.now() - startedAt) / 1000).toFixed(2));
-        console.error(
-          `[timing] item_detail ${offerId} (${lang}) ${durationSeconds}s`
-        );
-        return result;
-      } catch (err) {
-        lastError = err;
-        if (attempt === 2) break;
-        await sleep(1500);
+          const result = toTmapiItemDetail(raw);
+          const durationSeconds = Number(
+            ((Date.now() - startedAt) / 1000).toFixed(2)
+          );
+          console.error(
+            `[timing] item_detail ${offerId} (${lang}) ${durationSeconds}s`
+          );
+          return result;
+        } catch (err) {
+          lastError = err;
+          if (attempt === 2) break;
+          await sleep(600);
+        }
       }
+      return tmapiError(500, lastError?.message || "Scrape failed");
+    } finally {
+      await context.close().catch(() => {});
     }
-
-    return tmapiError(500, lastError?.message || "Scrape failed");
   } finally {
-    await browser.close();
+    if (headed) await browser.close().catch(() => {});
+    else releaseBrowser(browser);
   }
 }
 

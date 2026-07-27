@@ -1,7 +1,7 @@
 /**
  * Extra 1688 scrapers for TMAPI-compatible endpoints.
  */
-import { launchBrowser } from "./browser.js";
+import { acquirePooledBrowser, releaseBrowser } from "./browser.js";
 import { newAuthedContext, assertAuthLooksValid } from "./auth.js";
 import { proxyStatus } from "./proxy.js";
 import { normalizeLang, translateTexts } from "./translate.js";
@@ -55,7 +55,7 @@ export async function getItemDesc(itemId, { language = "zh" } = {}) {
   const id = String(itemId || "").trim();
   if (!/^\d+$/.test(id)) return tmapiError(422, "item_id must be a number");
   const lang = normalizeLang(language);
-  const browser = await launchBrowser({ headed: false });
+  const browser = await acquirePooledBrowser();
   try {
     const { context, page } = await openOfferPage(browser, id, lang);
     try {
@@ -120,7 +120,7 @@ export async function getItemDesc(itemId, { language = "zh" } = {}) {
   } catch (err) {
     return tmapiError(500, err.message || "item_desc failed");
   } finally {
-    await browser.close();
+    releaseBrowser(browser);
   }
 }
 
@@ -132,7 +132,7 @@ export async function getItemReviews(
   const id = String(itemId || "").trim();
   if (!/^\d+$/.test(id)) return tmapiError(422, "item_id must be a number");
   const lang = normalizeLang(language);
-  const browser = await launchBrowser({ headed: false });
+  const browser = await acquirePooledBrowser();
   try {
     const { context, page: p } = await openOfferPage(browser, id, lang);
     try {
@@ -185,7 +185,7 @@ export async function getItemReviews(
   } catch (err) {
     return tmapiError(500, err.message || "item_review failed");
   } finally {
-    await browser.close();
+    releaseBrowser(browser);
   }
 }
 
@@ -194,7 +194,7 @@ export async function getItemFreight(itemId, { language = "zh" } = {}) {
   const id = String(itemId || "").trim();
   if (!/^\d+$/.test(id)) return tmapiError(422, "item_id must be a number");
   const lang = normalizeLang(language);
-  const browser = await launchBrowser({ headed: false });
+  const browser = await acquirePooledBrowser();
   try {
     const { context, page } = await openOfferPage(browser, id, lang);
     try {
@@ -250,7 +250,7 @@ export async function getItemFreight(itemId, { language = "zh" } = {}) {
   } catch (err) {
     return tmapiError(500, err.message || "item_freight failed");
   } finally {
-    await browser.close();
+    releaseBrowser(browser);
   }
 }
 
@@ -302,7 +302,7 @@ export async function getShopItems({
   const pageNo = Math.max(1, Number(page) || 1);
   const size = Math.min(50, Math.max(1, Number(page_size) || 20));
   const offerListUrl = `https://winport.m.1688.com/page/offerlist.html?memberId=${encodeURIComponent(mid)}&pageNum=${pageNo}`;
-  const browser = await launchBrowser({ headed: false });
+  const browser = await acquirePooledBrowser();
 
   try {
     const context = await newAuthedContext(browser, {
@@ -443,7 +443,7 @@ export async function getShopItems({
   } catch (err) {
     return tmapiError(500, err.message || "shop items failed");
   } finally {
-    await browser.close();
+    releaseBrowser(browser);
   }
 }
 
@@ -453,7 +453,7 @@ export async function getShopInfo({ shop_url, member_id, language = "zh" } = {})
   if (!mid) return tmapiError(422, "member_id or shop_url is required");
   const lang = normalizeLang(language);
   const url = `https://winport.m.1688.com/page/index.html?memberId=${encodeURIComponent(mid)}`;
-  const browser = await launchBrowser({ headed: false });
+  const browser = await acquirePooledBrowser();
   try {
     const context = await newAuthedContext(browser, {
       isMobile: true,
@@ -497,7 +497,7 @@ export async function getShopInfo({ shop_url, member_id, language = "zh" } = {})
   } catch (err) {
     return tmapiError(500, err.message || "shop info failed");
   } finally {
-    await browser.close();
+    releaseBrowser(browser);
   }
 }
 
@@ -511,7 +511,7 @@ export async function getShopCategories({
   if (!mid) return tmapiError(422, "member_id or shop_url is required");
   const lang = normalizeLang(language);
   const url = `https://winport.m.1688.com/page/offerlist.html?memberId=${encodeURIComponent(mid)}`;
-  const browser = await launchBrowser({ headed: false });
+  const browser = await acquirePooledBrowser();
   try {
     const context = await newAuthedContext(browser, {
       isMobile: true,
@@ -562,7 +562,7 @@ export async function getShopCategories({
   } catch (err) {
     return tmapiError(500, err.message || "shop categories failed");
   } finally {
-    await browser.close();
+    releaseBrowser(browser);
   }
 }
 
@@ -632,7 +632,7 @@ export async function searchByImage({
   const lang = normalizeLang(language);
   const pageNo = Math.max(1, Number(page) || 1);
   const size = Math.min(20, Math.max(1, Number(page_size) || 20));
-  const browser = await launchBrowser({ headed: false });
+  const browser = await acquirePooledBrowser();
 
   try {
     const context = await newAuthedContext(browser, {
@@ -712,7 +712,7 @@ export async function searchByImage({
   } catch (err) {
     return tmapiError(500, err.message || "image search failed");
   } finally {
-    await browser.close();
+    releaseBrowser(browser);
   }
 }
 
@@ -775,7 +775,7 @@ export async function searchFactories({
 export async function getCategoryInfo({ cat_id = "", language = "zh" } = {}) {
   const cat = String(cat_id || "").trim();
   const lang = normalizeLang(language);
-  const browser = await launchBrowser({ headed: false });
+  const browser = await acquirePooledBrowser();
   try {
     const context = await newAuthedContext(browser, {
       locale: lang === "en" ? "en-US" : "zh-CN",
@@ -853,7 +853,7 @@ export async function getCategoryInfo({ cat_id = "", language = "zh" } = {}) {
   } catch (err) {
     return tmapiError(500, err.message || "category info failed");
   } finally {
-    await browser.close();
+    releaseBrowser(browser);
   }
 }
 
@@ -878,7 +878,7 @@ export async function getCategoryProducts({
     return searchItemsTmapi({ keyword, page, page_size, sort, language });
   }
 
-  const browser = await launchBrowser({ headed: false });
+  const browser = await acquirePooledBrowser();
   try {
     const context = await newAuthedContext(browser, {
       locale: lang === "en" ? "en-US" : "zh-CN",
@@ -940,7 +940,7 @@ export async function getCategoryProducts({
   } catch (err) {
     return tmapiError(500, err.message || "category products failed");
   } finally {
-    await browser.close();
+    releaseBrowser(browser);
   }
 }
 

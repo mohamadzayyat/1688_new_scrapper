@@ -1,5 +1,5 @@
 import { assertAuthLooksValid, newAuthedContext } from "./auth.js";
-import { launchBrowser } from "./browser.js";
+import { launchBrowser, acquirePooledBrowser, releaseBrowser } from "./browser.js";
 import { proxyStatus } from "./proxy.js";
 import { normalizeLang, translateTexts } from "./translate.js";
 
@@ -286,7 +286,9 @@ export async function searchOffers(
     );
   }
 
-  const browser = await launchBrowser({ headed });
+  const browser = headed
+    ? await launchBrowser({ headed: true })
+    : await acquirePooledBrowser();
 
   try {
     let lastError;
@@ -353,12 +355,13 @@ export async function searchOffers(
       } catch (err) {
         lastError = err;
         if (attempt === 2) break;
-        await sleep(1500);
+        await sleep(800);
       }
     }
 
     throw lastError;
   } finally {
-    await browser.close();
+    if (headed) await browser.close().catch(() => {});
+    else releaseBrowser(browser);
   }
 }
