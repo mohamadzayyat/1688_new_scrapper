@@ -254,21 +254,37 @@ export async function getItemFreight(itemId, { language = "zh" } = {}) {
   }
 }
 
-function normalizeShopUrl(input) {
-  const s = String(input || "").trim();
-  if (!s) return null;
-  if (/^https?:\/\//i.test(s)) return s;
-  if (s.includes("memberId=")) {
-    return `https://winport.m.1688.com/page/index.html?${s.includes("?") ? s.split("?")[1] : `memberId=${s}`}`;
-  }
-  if (/^b2b-/i.test(s) || /^[a-z0-9_-]+$/i.test(s)) {
-    if (s.includes(".")) return `https://${s.replace(/^https?:\/\//, "")}`;
-    return `https://winport.m.1688.com/page/index.html?memberId=${s}`;
-  }
-  return `https://${s}`;
+function extractMemberId(shop_url, member_id) {
+  if (member_id) return String(member_id).trim();
+  const s = String(shop_url || "");
+  const m =
+    s.match(/memberId=([^&]+)/i) ||
+    s.match(/winport\/(b2b-[^/.]+)/i) ||
+    s.match(/\/\/(b2b-[^/.]+)\.1688\.com/i);
+  return m ? decodeURIComponent(m[1]) : "";
 }
 
-/** GET /1688/shop/items/v2 */
+function collectOfferIdsFromText(text, set) {
+  if (!text) return;
+  for (const m of String(text).matchAll(
+    /["']?(?:offerId|offer_id|offerid)["']?\s*[:=]\s*["']?(\d{8,})/gi
+  )) {
+    set.add(m[1]);
+  }
+  for (const m of String(text).matchAll(
+    /detail\.1688\.com\/offer\/(\d{8,})/gi
+  )) {
+    set.add(m[1]);
+  }
+  for (const m of String(text).matchAll(/\/offer\/(\d{8,})/gi)) {
+    set.add(m[1]);
+  }
+}
+
+/**
+ * GET /1688/shop/items (by member_id)
+ * GET /1688/shop/items/v2 (by shop_url)
+ */
 export async function getShopItems({
   shop_url,
   member_id,
@@ -276,60 +292,77 @@ export async function getShopItems({
   page_size = 20,
   sort = "default",
   keyword = "",
+  shop_cat_id = "",
   language = "zh",
 } = {}) {
-  const url =
-    normalizeShopUrl(shop_url) ||
-    (member_id
-      ? `https://winport.m.1688.com/page/index.html?memberId=${member_id}`
-      : null);
-  if (!url) return tmapiError(422, "shop_url or member_id is required");
+  const mid = extractMemberId(shop_url, member_id);
+  if (!mid) return tmapiError(422, "member_id or shop_url is required");
 
   const lang = normalizeLang(language);
   const pageNo = Math.max(1, Number(page) || 1);
   const size = Math.min(50, Math.max(1, Number(page_size) || 20));
+  const offerListUrl = `https://winport.m.1688.com/page/offerlist.html?memberId=${encodeURIComponent(mid)}&pageNum=${pageNo}`;
   const browser = await launchBrowser({ headed: false });
 
   try {
     const context = await newAuthedContext(browser, {
+      isMobile: true,
+      hasTouch: true,
       locale: lang === "en" ? "en-US" : "zh-CN",
-      viewport: { width: 1280, height: 900 },
+      viewport: { width: 390, height: 844 },
       userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
     });
     await withLangCookies(context, lang);
     const p = await context.newPage();
+    const netIds = new Set();
+    const onResp = async (res) => {
+      try {
+        const u = res.url();
+        if (!/winport|offer|asyncView|mtop/i.test(u)) return;
+        const text = await res.text();
+        if (text && text.length < 2_000_000) collectOfferIdsFromText(text, netIds);
+      } catch {
+        /* ignore */
+      }
+    };
+    p.on("response", onResp);
+
     try {
-      await p.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-      await sleep(2500);
-      // Try open "all products" / 商品 tab
-      await p.evaluate(() => {
-        const btn = [...document.querySelectorAll("a,button,span,div")].find((el) =>
-          /全部商品|所有产品|商品|Products/i.test((el.textContent || "").trim())
-        );
-        btn?.click();
-      });
-      await sleep(2000);
-      for (let i = 0; i < 4; i++) {
-        await p.evaluate(() => window.scrollBy(0, 900));
+      await p.goto(offerListUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await sleep(3500);
+      for (let i = 0; i < 5; i++) {
+        await p.evaluate(() => window.scrollBy(0, 700));
         await sleep(400);
       }
 
-      const scraped = await p.evaluate(({ pageNo, size, keyword }) => {
+      const scraped = await p.evaluate(() => {
         const items = [];
         const seen = new Set();
-        const anchors = document.querySelectorAll(
-          "a[href*='detail.1688.com/offer'], a[href*='/offer/'], a[offerid], a[data-offer-id]"
-        );
-        for (const a of anchors) {
-          const href = a.href || "";
-          const m =
-            href.match(/offer\/(\d+)/) ||
-            [null, a.getAttribute("offerid") || a.getAttribute("data-offer-id")];
-          if (!m?.[1]) continue;
-          const id = String(m[1]);
-          if (!/^\d{8,}$/.test(id) || seen.has(id)) continue;
-          seen.add(id);
+        const push = (id, title, img, price, sales) => {
+          const sid = String(id || "").replace(/\D/g, "");
+          if (sid.length < 8 || seen.has(sid)) return;
+          seen.add(sid);
+          items.push({
+            item_id: sid,
+            title: (title || "").slice(0, 200),
+            img: img || "",
+            price: price != null ? String(price) : null,
+            sale_quantity: sales ?? 0,
+          });
+        };
+
+        for (const a of document.querySelectorAll(
+          "a[href], [offerid], [data-offer-id], [data-id]"
+        )) {
+          const href = a.href || a.getAttribute("href") || "";
+          const m = href.match(/offer\/(\d{8,})/i);
+          const id =
+            m?.[1] ||
+            a.getAttribute("offerid") ||
+            a.getAttribute("data-offer-id") ||
+            a.getAttribute("data-id");
+          if (!id) continue;
           const card = a.closest("li,div,article,section") || a;
           const text = (card.innerText || "").trim();
           const title =
@@ -337,52 +370,74 @@ export async function getShopItems({
             a.querySelector("img")?.alt ||
             text.split("\n").find((l) => l.length > 6) ||
             "";
-          if (keyword && !`${title}\n${text}`.includes(keyword)) continue;
           const img =
-            a.querySelector("img")?.src ||
-            card.querySelector("img")?.src ||
-            "";
+            a.querySelector("img")?.src || card.querySelector("img")?.src || "";
           const priceMatch = text.match(/¥\s*([\d.]+)|([\d.]+)\s*元/);
-          const salesMatch = text.match(
-            /成交[^\d]*([\d.]+[万+]?)|([\d.]+)\s*人付款|([\d.]+)\s*sold/i
-          );
-          items.push({
-            item_id: id,
-            title: title.slice(0, 200),
+          push(
+            id,
+            title,
             img,
-            price: priceMatch?.[1] || priceMatch?.[2] || null,
-            sale_quantity: salesMatch?.[1] || salesMatch?.[2] || salesMatch?.[3] || 0,
-          });
+            priceMatch?.[1] || priceMatch?.[2] || null,
+            0
+          );
+        }
+
+        // HTML/script blobs
+        const html = document.documentElement?.innerHTML || "";
+        for (const m of html.matchAll(/offerId["']?\s*[:=]\s*["']?(\d{8,})/gi)) {
+          push(m[1], "", "", null, 0);
         }
 
         const company =
           document.querySelector("title")?.textContent?.replace(/[-_].*$/, "").trim() ||
           "";
+        return { company, items, member_id: null };
+      });
 
-        const start = (pageNo - 1) * size;
-        return {
-          company,
-          total_count: items.length,
-          items: items.slice(start, start + size),
-        };
-      }, { pageNo, size, keyword });
-
-      if (lang === "en" && scraped.items.length) {
-        const titles = await translateTexts(scraped.items.map((i) => i.title));
-        scraped.items = scraped.items.map((it, i) => ({
-          ...it,
-          title: titles[i] || it.title,
-        }));
+      // merge network-captured ids
+      for (const id of netIds) {
+        if (!scraped.items.some((it) => it.item_id === id)) {
+          scraped.items.push({
+            item_id: id,
+            title: "",
+            img: "",
+            price: null,
+            sale_quantity: 0,
+          });
+        }
       }
 
-      return toTmapiShopItems(scraped, {
-        page: pageNo,
-        page_size: size,
-        sort,
-        keyword,
-        cat: "",
-      });
+      let items = scraped.items;
+      if (keyword) {
+        items = items.filter((it) =>
+          `${it.title}`.toLowerCase().includes(String(keyword).toLowerCase())
+        );
+      }
+      void shop_cat_id;
+      void sort;
+
+      const start = (pageNo - 1) * size;
+      const pageItems = items.slice(start, start + size);
+
+      if (lang === "en" && pageItems.length) {
+        const titles = await translateTexts(pageItems.map((i) => i.title || i.item_id));
+        for (let i = 0; i < pageItems.length; i++) {
+          if (pageItems[i].title) pageItems[i].title = titles[i] || pageItems[i].title;
+        }
+      }
+
+      return toTmapiShopItems(
+        { total_count: items.length, items: pageItems },
+        {
+          page: pageNo,
+          page_size: size,
+          sort,
+          keyword,
+          cat: shop_cat_id || "",
+        }
+      );
     } finally {
+      p.off("response", onResp);
       await context.close();
     }
   } catch (err) {
@@ -394,45 +449,47 @@ export async function getShopItems({
 
 /** GET /1688/shop/info */
 export async function getShopInfo({ shop_url, member_id, language = "zh" } = {}) {
-  const url =
-    normalizeShopUrl(shop_url) ||
-    (member_id
-      ? `https://winport.m.1688.com/page/index.html?memberId=${member_id}`
-      : null);
-  if (!url) return tmapiError(422, "shop_url or member_id is required");
+  const mid = extractMemberId(shop_url, member_id);
+  if (!mid) return tmapiError(422, "member_id or shop_url is required");
   const lang = normalizeLang(language);
+  const url = `https://winport.m.1688.com/page/index.html?memberId=${encodeURIComponent(mid)}`;
   const browser = await launchBrowser({ headed: false });
   try {
     const context = await newAuthedContext(browser, {
+      isMobile: true,
+      hasTouch: true,
       locale: lang === "en" ? "en-US" : "zh-CN",
-      viewport: { width: 1280, height: 900 },
+      viewport: { width: 390, height: 844 },
     });
     await withLangCookies(context, lang);
     const page = await context.newPage();
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-      await sleep(2500);
-      const info = await page.evaluate(() => {
+      await sleep(3000);
+      const info = await page.evaluate((memberId) => {
         const text = document.body?.innerText || "";
         const title = document.title || "";
-        const memberMatch = location.href.match(/memberId=([^&]+)/);
         const company =
-          [...document.querySelectorAll("h1,h2,.company-name,[class*='company']")]
+          [...document.querySelectorAll("h1,h2,[class*='company'],[class*='shop-name']")]
             .map((el) => (el.textContent || "").trim())
             .find((t) => t && t.length > 2 && t.length < 80) ||
           title.replace(/[-_|].*$/, "").trim() ||
           null;
-        const lines = text
-          .split("\n")
-          .map((l) => l.trim())
-          .filter(Boolean);
         return {
+          member_id: memberId,
           shop_name: company,
+          company_name: company,
           shop_url: location.href,
-          member_id: memberMatch ? decodeURIComponent(memberMatch[1]) : null,
-          snippet: lines.slice(0, 30),
+          login_id: "",
+          identity_tags: [],
+          service_tags: [],
+          snippet: text
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(Boolean)
+            .slice(0, 40),
         };
-      });
+      }, mid);
       return tmapiOk(info);
     } finally {
       await context.close();
@@ -444,42 +501,61 @@ export async function getShopInfo({ shop_url, member_id, language = "zh" } = {})
   }
 }
 
-/** GET /1688/shop/cats — shop categories (best-effort from shop page links) */
-export async function getShopCategories({ shop_url, member_id, language = "zh" } = {}) {
-  const url =
-    normalizeShopUrl(shop_url) ||
-    (member_id
-      ? `https://winport.m.1688.com/page/index.html?memberId=${member_id}`
-      : null);
-  if (!url) return tmapiError(422, "shop_url or member_id is required");
+/** GET /1688/shop/cats */
+export async function getShopCategories({
+  shop_url,
+  member_id,
+  language = "zh",
+} = {}) {
+  const mid = extractMemberId(shop_url, member_id);
+  if (!mid) return tmapiError(422, "member_id or shop_url is required");
   const lang = normalizeLang(language);
+  const url = `https://winport.m.1688.com/page/offerlist.html?memberId=${encodeURIComponent(mid)}`;
   const browser = await launchBrowser({ headed: false });
   try {
     const context = await newAuthedContext(browser, {
+      isMobile: true,
+      hasTouch: true,
       locale: lang === "en" ? "en-US" : "zh-CN",
-      viewport: { width: 1280, height: 900 },
+      viewport: { width: 390, height: 844 },
     });
     await withLangCookies(context, lang);
     const page = await context.newPage();
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-      await sleep(2500);
+      await sleep(3000);
       const cats = await page.evaluate(() => {
         const out = [];
         const seen = new Set();
-        for (const a of document.querySelectorAll("a")) {
+        for (const a of document.querySelectorAll("a,button,span,li")) {
           const name = (a.textContent || "").trim();
+          if (!name || name.length > 30 || name.length < 2) continue;
+          if (!/分类|全部|类目|category|cat/i.test(name) && name.length > 12) continue;
+          if (/登录|客服|关注|分享|首页/.test(name)) continue;
           const href = a.href || "";
-          if (!name || name.length > 40) continue;
-          if (!/分类|category|cat|产品|全部商品|枕|棉|垫/i.test(name + href)) continue;
-          if (seen.has(name)) continue;
-          seen.add(name);
-          out.push({ name, url: href });
-          if (out.length >= 50) break;
+          const catId =
+            (href.match(/cat(?:egory)?Id?=(\d+)/i) ||
+              href.match(/shop_cat[^=]*=(\d+)/i) ||
+              [])[1] || "";
+          const key = `${name}|${catId}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          if (/分类|全部商品|类目|产品/.test(name) || catId) {
+            out.push({
+              cat_id: catId || null,
+              name,
+              url: href || null,
+            });
+          }
+          if (out.length >= 40) break;
         }
         return out;
       });
-      return tmapiOk({ shop_url: url, categories: cats });
+      return tmapiOk({
+        member_id: mid,
+        shop_url: url,
+        categories: cats,
+      });
     } finally {
       await context.close();
     }
@@ -497,11 +573,11 @@ export async function searchItemsTmapi({
   page_size = 20,
   sort = "default",
   language = "zh",
+  cat_id = "",
 } = {}) {
   const q = String(keyword || "").trim();
-  if (!q) return tmapiError(422, "keyword is required");
+  if (!q && !cat_id) return tmapiError(422, "keyword or cat_id is required");
   try {
-    // Ensure proxy/auth available
     const auth = await assertAuthLooksValid();
     const proxy = proxyStatus();
     if (!auth.ok && !proxy.enabled) {
@@ -509,6 +585,16 @@ export async function searchItemsTmapi({
         500,
         `No valid 1688 login (${auth.reason}) and proxy disabled. Run npm run login or enable proxy.`
       );
+    }
+
+    if (cat_id && !q) {
+      return getCategoryProducts({
+        cat_id,
+        page,
+        page_size,
+        language,
+        sort,
+      });
     }
 
     const raw = await searchOffers(q, {
@@ -521,7 +607,6 @@ export async function searchItemsTmapi({
       page_size: Math.min(20, Math.max(1, Number(page_size) || raw.pageSize || 20)),
       sort,
     });
-    // Trim to page_size
     if (formatted.data.items.length > formatted.data.page_size) {
       formatted.data.items = formatted.data.items.slice(0, formatted.data.page_size);
     }
@@ -532,18 +617,21 @@ export async function searchItemsTmapi({
 }
 
 /**
- * POST /1688/search/img — image search (best-effort via 1688 similar search page)
- * Body: { img_url, page?, language? }
+ * GET/POST /1688/search/image
+ * GET/POST /1688/global/search/image[/v2]
  */
 export async function searchByImage({
   img_url,
   page = 1,
+  page_size = 20,
   language = "zh",
+  sort = "default",
 } = {}) {
   const img = String(img_url || "").trim();
   if (!img) return tmapiError(422, "img_url is required");
   const lang = normalizeLang(language);
   const pageNo = Math.max(1, Number(page) || 1);
+  const size = Math.min(20, Math.max(1, Number(page_size) || 20));
   const browser = await launchBrowser({ headed: false });
 
   try {
@@ -554,26 +642,26 @@ export async function searchByImage({
     await withLangCookies(context, lang);
     const p = await context.newPage();
     try {
-      // 1688 image/similar search entry
       const searchUrl =
         "https://s.1688.com/selloffer/offer_search.htm?keywords=&imageAddress=" +
         encodeURIComponent(img) +
         `&beginPage=${pageNo}`;
       await p.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
-      await sleep(3000);
+      await sleep(4000);
 
-      // Fallback: keyword-less page may not work — try youyuan
       let items = await p.evaluate(() => {
         const list = window.data?.offerV2Showed?.offerList;
         if (Array.isArray(list) && list.length) {
           return list.map((it) => ({
             offerId: String(it.offerId || ""),
-            title: (it.title || "").replace(/<[^>]+>/g, ""),
+            title: String(it.title || "").replace(/<[^>]+>/g, ""),
             price: it.priceInfo?.price || it.price || null,
             image: it.offerPicUrl || null,
             company: it.companyName || null,
             sales: it.bookedCount != null ? String(it.bookedCount) : null,
             location: [it.province, it.city].filter(Boolean).join("") || null,
+            member_id: it.sellerMemberId || it.memberId || "",
+            login_id: it.loginId || "",
             isAd: false,
           }));
         }
@@ -581,7 +669,6 @@ export async function searchByImage({
       });
 
       if (!items.length) {
-        // DOM fallback
         items = await p.evaluate(() => {
           const out = [];
           for (const a of document.querySelectorAll("a[href*='offer/']")) {
@@ -598,7 +685,7 @@ export async function searchByImage({
               location: null,
               isAd: false,
             });
-            if (out.length >= 20) break;
+            if (out.length >= 40) break;
           }
           return out;
         });
@@ -609,9 +696,15 @@ export async function searchByImage({
         items = items.map((it, i) => ({ ...it, title: titles[i] || it.title }));
       }
 
+      const sliced = items.slice(0, size);
       return toTmapiSearch(
-        { results: items, total: items.length },
-        { keyword: "[image]", page: pageNo, page_size: items.length || 20, sort: "default" }
+        { results: sliced, total: items.length },
+        {
+          keyword: "[image]",
+          page: pageNo,
+          page_size: size,
+          sort,
+        }
       );
     } finally {
       await context.close();
@@ -623,10 +716,151 @@ export async function searchByImage({
   }
 }
 
-/** GET /1688/category/products — use keyword search with category hint */
+/**
+ * GET /1688/search/factory
+ * Company search is captcha-heavy; derive unique factories from product search.
+ */
+export async function searchFactories({
+  keywords,
+  keyword,
+  page = 1,
+  page_size = 20,
+  sort = "default",
+  language = "zh",
+} = {}) {
+  const q = String(keywords || keyword || "").trim();
+  if (!q) return tmapiError(422, "keywords is required");
+  const lang = normalizeLang(language);
+  const pageNo = Math.max(1, Number(page) || 1);
+  const size = Math.min(20, Math.max(1, Number(page_size) || 20));
+
+  try {
+    const raw = await searchOffers(q, { page: pageNo, lang });
+    const byKey = new Map();
+    for (const it of raw.results || []) {
+      const key = it.company || it.login_id || it.offerId;
+      if (!key || byKey.has(key)) continue;
+      byKey.set(key, {
+        member_id: it.member_id || "",
+        company_name: it.company || "",
+        login_id: it.login_id || "",
+        shop_url: it.member_id
+          ? `https://winport.m.1688.com/page/index.html?memberId=${it.member_id}`
+          : "",
+        location: it.location || "",
+        shop_repurchase_rate: it.repurchaseRate || null,
+        sample_item_id: it.offerId || "",
+        sample_title: it.title || "",
+        identity_tags: it.tags || [],
+      });
+    }
+    const all = [...byKey.values()];
+    // enrich from desktop offer objects if present via another scrape pass is too heavy;
+    // titles already translated when lang=en by searchOffers
+    void sort;
+    return tmapiOk({
+      page: pageNo,
+      page_size: size,
+      total_count: String(all.length),
+      keywords: q,
+      sort,
+      items: all.slice(0, size),
+    });
+  } catch (err) {
+    return tmapiError(500, err.message || "factory search failed");
+  }
+}
+
+/** GET /1688/category/info */
+export async function getCategoryInfo({ cat_id = "", language = "zh" } = {}) {
+  const cat = String(cat_id || "").trim();
+  const lang = normalizeLang(language);
+  const browser = await launchBrowser({ headed: false });
+  try {
+    const context = await newAuthedContext(browser, {
+      locale: lang === "en" ? "en-US" : "zh-CN",
+      viewport: { width: 1440, height: 900 },
+    });
+    await withLangCookies(context, lang);
+    const page = await context.newPage();
+    try {
+      const url = cat
+        ? `https://s.1688.com/selloffer/offer_search.htm?keywords=*&filt=y&n=y&categoryId=${encodeURIComponent(cat)}&beginPage=1`
+        : `https://s.1688.com/selloffer/offer_search.htm?keywords=*&beginPage=1`;
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await sleep(4000);
+
+      const info = await page.evaluate((categoryId) => {
+        const data = window.data || {};
+        const filters =
+          data.filterData ||
+          data.offerresultData?.data?.filterList ||
+          data.abResultData?.filterList ||
+          [];
+        const children = [];
+        const walk = (nodes) => {
+          if (!Array.isArray(nodes)) return;
+          for (const n of nodes) {
+            const id = String(n.id || n.catId || n.categoryId || "");
+            const name = n.name || n.text || n.title || "";
+            if (id && name) children.push({ cat_id: id, name });
+            if (n.children) walk(n.children);
+            if (n.subList) walk(n.subList);
+          }
+        };
+        walk(filters);
+
+        // also parse visible category chips
+        for (const a of document.querySelectorAll("a")) {
+          const href = a.href || "";
+          const m = href.match(/categoryId=(\d+)/i);
+          const name = (a.textContent || "").trim();
+          if (m && name && name.length < 40) {
+            children.push({ cat_id: m[1], name });
+          }
+        }
+
+        const uniq = [];
+        const seen = new Set();
+        for (const c of children) {
+          if (seen.has(c.cat_id)) continue;
+          seen.add(c.cat_id);
+          uniq.push(c);
+        }
+
+        return {
+          cat_id: categoryId || null,
+          name: categoryId
+            ? document.title?.split("-")[0]?.trim() || String(categoryId)
+            : "root",
+          path: categoryId ? [String(categoryId)] : [],
+          children: uniq.slice(0, 100),
+        };
+      }, cat);
+
+      if (lang === "en" && info.children?.length) {
+        const names = await translateTexts(info.children.map((c) => c.name));
+        info.children = info.children.map((c, i) => ({
+          ...c,
+          name: names[i] || c.name,
+        }));
+      }
+
+      return tmapiOk(info);
+    } finally {
+      await context.close();
+    }
+  } catch (err) {
+    return tmapiError(500, err.message || "category info failed");
+  } finally {
+    await browser.close();
+  }
+}
+
+/** GET /1688/category/products[+ /v2] */
 export async function getCategoryProducts({
   cat_id,
-  keyword = "",
+  keyword = "*",
   page = 1,
   page_size = 20,
   language = "zh",
@@ -636,13 +870,92 @@ export async function getCategoryProducts({
   if (!cat && !keyword) {
     return tmapiError(422, "cat_id or keyword is required");
   }
-  // 1688 category browsing is inconsistent anonymously; use keyword = cat name/id fallback
-  const q = keyword || cat;
+  const lang = normalizeLang(language);
+  const pageNo = Math.max(1, Number(page) || 1);
+  const size = Math.min(20, Math.max(1, Number(page_size) || 20));
+
+  if (!cat) {
+    return searchItemsTmapi({ keyword, page, page_size, sort, language });
+  }
+
+  const browser = await launchBrowser({ headed: false });
+  try {
+    const context = await newAuthedContext(browser, {
+      locale: lang === "en" ? "en-US" : "zh-CN",
+      viewport: { width: 1440, height: 900 },
+    });
+    await withLangCookies(context, lang);
+    const page = await context.newPage();
+    try {
+      const kw = keyword && keyword !== "*" ? keyword : "*";
+      const url =
+        `https://s.1688.com/selloffer/offer_search.htm?keywords=${encodeURIComponent(kw)}` +
+        `&filt=y&n=y&categoryId=${encodeURIComponent(cat)}&beginPage=${pageNo}`;
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await sleep(4500);
+
+      let items = await page.evaluate(() => {
+        const list = window.data?.offerV2Showed?.offerList || [];
+        return list.map((it) => ({
+          offerId: String(it.offerId || ""),
+          title: String(it.title || "").replace(/<[^>]+>/g, ""),
+          price: it.priceInfo?.price || it.price || null,
+          image: it.offerPicUrl || null,
+          company: it.companyName || null,
+          sales: it.bookedCount != null ? String(it.bookedCount) : null,
+          location: [it.province, it.city].filter(Boolean).join("") || null,
+          member_id: it.sellerMemberId || "",
+          login_id: it.loginId || "",
+          isAd: it.isBid === "true",
+        }));
+      });
+
+      const total =
+        (await page.evaluate(
+          () =>
+            Number(
+              window.data?.offerresultData?.data?.totalCount ||
+                window.data?.abResultData?.totalCount ||
+                0
+            ) || null
+        )) || items.length;
+
+      if (lang === "en" && items.length) {
+        const titles = await translateTexts(items.map((i) => i.title));
+        items = items.map((it, i) => ({ ...it, title: titles[i] || it.title }));
+      }
+
+      return toTmapiSearch(
+        { results: items.slice(0, size), total },
+        {
+          keyword: kw === "*" ? `[cat:${cat}]` : kw,
+          page: pageNo,
+          page_size: size,
+          sort,
+        }
+      );
+    } finally {
+      await context.close();
+    }
+  } catch (err) {
+    return tmapiError(500, err.message || "category products failed");
+  } finally {
+    await browser.close();
+  }
+}
+
+/** Cross-border multilingual keyword search → same shape as search/items */
+export async function searchItemsCrossBorder(opts = {}) {
   return searchItemsTmapi({
-    keyword: q,
-    page,
-    page_size,
-    sort,
-    language,
+    ...opts,
+    language: opts.language || "en",
+  });
+}
+
+/** Cross-border image search → same as search/image with language default en */
+export async function searchByImageCrossBorder(opts = {}) {
+  return searchByImage({
+    ...opts,
+    language: opts.language || "en",
   });
 }

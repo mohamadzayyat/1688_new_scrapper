@@ -6,96 +6,75 @@ const DEFAULT_SHOP =
 const DEFAULT_IMG =
   "https://cbu01.alicdn.com/img/ibank/O1CN01AN5iRY1QvSD0m86OZ_!!2218225422038-0-cib.jpg";
 const DEFAULT_KEYWORD = "armrest pad";
+const DEFAULT_CAT = "122234002";
 
-/** @type {Array<{id:string,label:string,method:string,path:string,fields:Array<object>}>} */
+const LANG = {
+  name: "language",
+  label: "language",
+  type: "select",
+  options: ["en", "zh"],
+  default: "en",
+};
+
+/** Exact TMAPI-style paths + defaults for the tester UI */
 const APIS = [
   {
     id: "item_detail",
-    label: "Item detail (by ID)",
+    label: "Get product details (By ID)",
     method: "GET",
     path: "/1688/v2/item_detail",
     fields: [
       { name: "item_id", label: "item_id", default: DEFAULT_ITEM, required: true },
-      {
-        name: "language",
-        label: "language",
-        type: "select",
-        options: ["en", "zh"],
-        default: "en",
-      },
+      LANG,
       { name: "optimize_title", label: "optimize_title", type: "checkbox", default: false },
     ],
   },
   {
     id: "item_detail_by_url",
-    label: "Item detail (by URL)",
+    label: "Get product details (By URL)",
     method: "POST",
     path: "/1688/v2/item_detail_by_url",
     fields: [
       { name: "url", label: "url", default: DEFAULT_URL, required: true, wide: true },
-      {
-        name: "language",
-        label: "language",
-        type: "select",
-        options: ["en", "zh"],
-        default: "en",
-      },
+      LANG,
       { name: "optimize_title", label: "optimize_title", type: "checkbox", default: false },
     ],
   },
   {
     id: "item_desc",
-    label: "Description pictures",
+    label: "Get product description pictures",
     method: "GET",
     path: "/1688/item_desc",
     fields: [
       { name: "item_id", label: "item_id", default: DEFAULT_ITEM, required: true },
-      {
-        name: "language",
-        label: "language",
-        type: "select",
-        options: ["en", "zh"],
-        default: "en",
-      },
+      LANG,
     ],
   },
   {
     id: "item_review",
-    label: "Reviews",
+    label: "Get product review list",
     method: "GET",
     path: "/1688/item_review",
     fields: [
       { name: "item_id", label: "item_id", default: DEFAULT_ITEM, required: true },
       { name: "page", label: "page", default: "1" },
       { name: "page_size", label: "page_size", default: "20" },
-      {
-        name: "language",
-        label: "language",
-        type: "select",
-        options: ["en", "zh"],
-        default: "en",
-      },
+      LANG,
     ],
   },
   {
     id: "item_freight",
-    label: "Shipping / freight",
+    label: "Get product shipping fee",
     method: "GET",
     path: "/1688/item_freight",
     fields: [
       { name: "item_id", label: "item_id", default: DEFAULT_ITEM, required: true },
-      {
-        name: "language",
-        label: "language",
-        type: "select",
-        options: ["en", "zh"],
-        default: "en",
-      },
+      LANG,
     ],
   },
   {
     id: "search_items",
-    label: "Search by keyword",
+    label: "Search products by keywords",
     method: "GET",
     path: "/1688/search/items",
     fields: [
@@ -109,111 +88,153 @@ const APIS = [
         options: ["default", "sales", "price_up", "price_down"],
         default: "default",
       },
-      {
-        name: "language",
-        label: "language",
-        type: "select",
-        options: ["en", "zh"],
-        default: "en",
-      },
+      LANG,
     ],
   },
   {
-    id: "search_img",
-    label: "Search by image",
-    method: "POST",
-    path: "/1688/search/img",
+    id: "search_image",
+    label: "Search products by image",
+    method: "GET",
+    path: "/1688/search/image",
     fields: [
       { name: "img_url", label: "img_url", default: DEFAULT_IMG, required: true, wide: true },
       { name: "page", label: "page", default: "1" },
-      {
-        name: "language",
-        label: "language",
-        type: "select",
-        options: ["en", "zh"],
-        default: "en",
-      },
+      { name: "page_size", label: "page_size", default: "10" },
+      LANG,
+    ],
+  },
+  {
+    id: "search_factory",
+    label: "Search factories by keywords",
+    method: "GET",
+    path: "/1688/search/factory",
+    fields: [
+      { name: "keywords", label: "keywords", default: DEFAULT_KEYWORD, required: true, wide: true },
+      { name: "page", label: "page", default: "1" },
+      { name: "page_size", label: "page_size", default: "10" },
+      LANG,
     ],
   },
   {
     id: "shop_items",
-    label: "Shop products",
+    label: "Get shop products (By ID)",
+    method: "GET",
+    path: "/1688/shop/items",
+    fields: [
+      { name: "member_id", label: "member_id", default: DEFAULT_MEMBER, required: true, wide: true },
+      { name: "page", label: "page", default: "1" },
+      { name: "page_size", label: "page_size", default: "10" },
+      LANG,
+    ],
+  },
+  {
+    id: "shop_items_v2",
+    label: "Get shop products (By URL)",
     method: "GET",
     path: "/1688/shop/items/v2",
     fields: [
-      { name: "shop_url", label: "shop_url", default: DEFAULT_SHOP, wide: true },
-      { name: "member_id", label: "member_id", default: DEFAULT_MEMBER },
+      { name: "shop_url", label: "shop_url", default: DEFAULT_SHOP, required: true, wide: true },
       { name: "page", label: "page", default: "1" },
       { name: "page_size", label: "page_size", default: "10" },
-      {
-        name: "language",
-        label: "language",
-        type: "select",
-        options: ["en", "zh"],
-        default: "en",
-      },
+      LANG,
     ],
   },
   {
     id: "shop_info",
-    label: "Shop info",
+    label: "Get shop information",
     method: "GET",
     path: "/1688/shop/info",
     fields: [
+      { name: "member_id", label: "member_id", default: DEFAULT_MEMBER, wide: true },
       { name: "shop_url", label: "shop_url", default: DEFAULT_SHOP, wide: true },
-      { name: "member_id", label: "member_id", default: DEFAULT_MEMBER },
-      {
-        name: "language",
-        label: "language",
-        type: "select",
-        options: ["en", "zh"],
-        default: "en",
-      },
+      LANG,
     ],
   },
   {
     id: "shop_cats",
-    label: "Shop categories",
+    label: "Get shop categories",
     method: "GET",
     path: "/1688/shop/cats",
     fields: [
-      { name: "shop_url", label: "shop_url", default: DEFAULT_SHOP, wide: true },
-      { name: "member_id", label: "member_id", default: DEFAULT_MEMBER },
-      {
-        name: "language",
-        label: "language",
-        type: "select",
-        options: ["en", "zh"],
-        default: "en",
-      },
+      { name: "member_id", label: "member_id", default: DEFAULT_MEMBER, wide: true },
+      LANG,
+    ],
+  },
+  {
+    id: "category_info",
+    label: "Get category info",
+    method: "GET",
+    path: "/1688/category/info",
+    fields: [
+      { name: "cat_id", label: "cat_id", default: DEFAULT_CAT },
+      LANG,
     ],
   },
   {
     id: "category_products",
-    label: "Category products",
+    label: "Get category products",
     method: "GET",
     path: "/1688/category/products",
     fields: [
-      { name: "cat_id", label: "cat_id", default: "122234002" },
-      { name: "keyword", label: "keyword", default: DEFAULT_KEYWORD, wide: true },
+      { name: "cat_id", label: "cat_id", default: DEFAULT_CAT, required: true },
       { name: "page", label: "page", default: "1" },
       { name: "page_size", label: "page_size", default: "10" },
-      {
-        name: "language",
-        label: "language",
-        type: "select",
-        options: ["en", "zh"],
-        default: "en",
-      },
+      LANG,
+    ],
+  },
+  {
+    id: "category_products_v2",
+    label: "Get category products V2",
+    method: "GET",
+    path: "/1688/category/products/v2",
+    fields: [
+      { name: "cat_id", label: "cat_id", default: DEFAULT_CAT, required: true },
+      { name: "page", label: "page", default: "1" },
+      { name: "page_size", label: "page_size", default: "10" },
+      LANG,
+    ],
+  },
+  {
+    id: "cross_search_items",
+    label: "Cross-border search by keywords",
+    method: "GET",
+    path: "/1688/search/items/v2",
+    fields: [
+      { name: "keyword", label: "keyword", default: DEFAULT_KEYWORD, required: true, wide: true },
+      { name: "page", label: "page", default: "1" },
+      { name: "page_size", label: "page_size", default: "10" },
+      LANG,
+    ],
+  },
+  {
+    id: "cross_search_image",
+    label: "Cross-border search by image",
+    method: "GET",
+    path: "/1688/global/search/image",
+    fields: [
+      { name: "img_url", label: "img_url", default: DEFAULT_IMG, required: true, wide: true },
+      { name: "page", label: "page", default: "1" },
+      LANG,
+    ],
+  },
+  {
+    id: "cross_search_image_v2",
+    label: "Cross-border search by image V2",
+    method: "GET",
+    path: "/1688/global/search/image/v2",
+    fields: [
+      { name: "img_url", label: "img_url", default: DEFAULT_IMG, required: true, wide: true },
+      { name: "page", label: "page", default: "1" },
+      LANG,
     ],
   },
   {
     id: "img_convert",
-    label: "Image URL convert",
+    label: "Image URL conversion",
     method: "GET",
-    path: "/1688/tools/img_convert",
+    path: "/1688/img/convert",
     fields: [
-      { name: "img_url", label: "img_url", default: DEFAULT_IMG, required: true, wide: true },
+      { name: "url", label: "url", default: DEFAULT_IMG, required: true, wide: true },
       { name: "width", label: "width", default: "220" },
       { name: "height", label: "height", default: "220" },
     ],
@@ -222,7 +243,7 @@ const APIS = [
     id: "parse_url",
     label: "Parse URL → ID",
     method: "GET",
-    path: "/1688/tools/parse_url",
+    path: "/tools/parse/url",
     fields: [
       { name: "url", label: "url", default: DEFAULT_URL, required: true, wide: true },
     ],
@@ -355,21 +376,33 @@ function renderSummary(data) {
   const d = data.data || data;
   const cards = [];
   if (d.item_id != null && d.skus) {
-    cards.push(["Item ID", d.item_id], ["Price", d.sku_price_scale || "—"], ["SKUs", d.skus?.length ?? "—"], ["Props", d.product_props?.length ?? "—"]);
+    cards.push(
+      ["Item ID", d.item_id],
+      ["Price", d.sku_price_scale || "—"],
+      ["SKUs", d.skus?.length ?? "—"],
+      ["Props", d.product_props?.length ?? "—"]
+    );
   } else if (Array.isArray(d.items)) {
-    cards.push(["Page", d.page ?? "—"], ["Items", d.items.length], ["Total", d.total_count ?? "—"], ["Keyword", d.keyword || "—"]);
+    cards.push(
+      ["Page", d.page ?? "—"],
+      ["Items", d.items.length],
+      ["Total", d.total_count ?? "—"],
+      ["Keyword", d.keyword || d.keywords || "—"]
+    );
   } else if (Array.isArray(d.images)) {
     cards.push(["Item ID", d.item_id ?? "—"], ["Images", d.images.length]);
   } else if (d.converted) {
     cards.push(["Width", d.width ?? "—"], ["Height", d.height ?? "—"]);
-  } else if (d.item_id && !d.skus) {
-    cards.push(["Item ID", d.item_id]);
-  } else if (d.shop_name) {
-    cards.push(["Shop", d.shop_name], ["Member", d.member_id || "—"]);
+  } else if (Array.isArray(d.children)) {
+    cards.push(["Cat", d.cat_id || "root"], ["Children", d.children.length]);
   } else if (Array.isArray(d.categories)) {
     cards.push(["Categories", d.categories.length]);
-  } else if (d.freight_text || d.shipping_raw) {
-    cards.push(["Freight", d.freight_text || "—"], ["From", d.location_from || "—"]);
+  } else if (d.shop_name || d.company_name) {
+    cards.push(["Shop", d.shop_name || d.company_name], ["Member", d.member_id || "—"]);
+  } else if (d.freight_text || d.logistics_text) {
+    cards.push(["Freight", d.freight_text || d.logistics_text || "—"]);
+  } else if (d.item_id) {
+    cards.push(["Item ID", d.item_id]);
   }
 
   if (!cards.length) {
@@ -380,7 +413,9 @@ function renderSummary(data) {
   summary.innerHTML = cards
     .map(
       ([label, value]) =>
-        `<article class="summary-card"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`
+        `<article class="summary-card"><span>${escapeHtml(label)}</span><strong>${escapeHtml(
+          value
+        )}</strong></article>`
     )
     .join("");
 }
@@ -390,6 +425,7 @@ function showResult(data) {
   latestName =
     data?.data?.item_id ||
     data?.data?.keyword ||
+    data?.data?.keywords ||
     current.id ||
     "result";
   panel.hidden = false;

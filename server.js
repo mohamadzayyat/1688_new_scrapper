@@ -16,6 +16,10 @@ import {
   searchItemsTmapi,
   searchByImage,
   getCategoryProducts,
+  getCategoryInfo,
+  searchFactories,
+  searchItemsCrossBorder,
+  searchByImageCrossBorder,
 } from "./extraScrape.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -232,41 +236,75 @@ async function handleSearchItems(req, res) {
   const page_size = Number(url.searchParams.get("page_size") || 20);
   const sort = url.searchParams.get("sort") || "default";
   const language = normalizeLanguage(url.searchParams.get("language") || "en");
-  if (!keyword) {
+  const cat_id = url.searchParams.get("cat_id") || "";
+  if (!keyword && !cat_id) {
     sendTmapi(res, tmapiError(422, "keyword is required"));
     return;
   }
-  await withJob(res, `search:${keyword}:${page}`, () =>
-    searchItemsTmapi({ keyword, page, page_size, sort, language })
+  await withJob(res, `search:${keyword || cat_id}:${page}`, () =>
+    searchItemsTmapi({ keyword, page, page_size, sort, language, cat_id })
   );
 }
 
 async function handleSearchImage(req, res) {
-  if (req.method !== "POST") {
+  let img_url = "";
+  let page = 1;
+  let page_size = 20;
+  let language = "en";
+  let sort = "default";
+
+  if (req.method === "GET") {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    img_url = url.searchParams.get("img_url") || url.searchParams.get("url") || "";
+    page = Number(url.searchParams.get("page") || 1);
+    page_size = Number(url.searchParams.get("page_size") || 20);
+    language = normalizeLanguage(url.searchParams.get("language") || "en");
+    sort = url.searchParams.get("sort") || "default";
+  } else if (req.method === "POST") {
+    const body = await readJsonBody(req);
+    if (body == null) {
+      sendTmapi(res, tmapiError(422, "Invalid JSON body"));
+      return;
+    }
+    img_url = body.img_url || body.image_url || body.url || "";
+    page = Number(body.page || 1);
+    page_size = Number(body.page_size || 20);
+    language = normalizeLanguage(body.language || "en");
+    sort = body.sort || "default";
+  } else {
     sendTmapi(
       res,
-      tmapiError(405, "Use POST /1688/search/img with JSON { img_url }")
+      tmapiError(405, "Use GET/POST /1688/search/image with img_url")
     );
     return;
   }
-  const body = await readJsonBody(req);
-  if (body == null) {
-    sendTmapi(res, tmapiError(422, "Invalid JSON body"));
+
+  await withJob(res, `search_img`, () =>
+    searchByImage({ img_url, page, page_size, language, sort })
+  );
+}
+
+async function handleSearchFactory(req, res) {
+  if (req.method !== "GET") {
+    sendTmapi(res, tmapiError(405, "Use GET /1688/search/factory?keywords=..."));
     return;
   }
-  const language = normalizeLanguage(body.language || "en");
-  await withJob(res, `search_img`, () =>
-    searchByImage({
-      img_url: body.img_url || body.image_url || body.url,
-      page: body.page || 1,
-      language,
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  await withJob(res, `search_factory`, () =>
+    searchFactories({
+      keywords:
+        url.searchParams.get("keywords") || url.searchParams.get("keyword") || "",
+      page: Number(url.searchParams.get("page") || 1),
+      page_size: Number(url.searchParams.get("page_size") || 20),
+      sort: url.searchParams.get("sort") || "default",
+      language: normalizeLanguage(url.searchParams.get("language") || "en"),
     })
   );
 }
 
 async function handleShopItems(req, res) {
   if (req.method !== "GET") {
-    sendTmapi(res, tmapiError(405, "Use GET /1688/shop/items/v2?..."));
+    sendTmapi(res, tmapiError(405, "Use GET /1688/shop/items or /1688/shop/items/v2"));
     return;
   }
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -278,6 +316,7 @@ async function handleShopItems(req, res) {
       page_size: Number(url.searchParams.get("page_size") || 20),
       sort: url.searchParams.get("sort") || "default",
       keyword: url.searchParams.get("keyword") || "",
+      shop_cat_id: url.searchParams.get("shop_cat_id") || url.searchParams.get("cat") || "",
       language: normalizeLanguage(url.searchParams.get("language") || "en"),
     })
   );
@@ -313,6 +352,20 @@ async function handleShopCats(req, res) {
   );
 }
 
+async function handleCategoryInfo(req, res) {
+  if (req.method !== "GET") {
+    sendTmapi(res, tmapiError(405, "Use GET /1688/category/info?cat_id=..."));
+    return;
+  }
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  await withJob(res, `category_info`, () =>
+    getCategoryInfo({
+      cat_id: url.searchParams.get("cat_id") || "",
+      language: normalizeLanguage(url.searchParams.get("language") || "en"),
+    })
+  );
+}
+
 async function handleCategoryProducts(req, res) {
   if (req.method !== "GET") {
     sendTmapi(res, tmapiError(405, "Use GET /1688/category/products?..."));
@@ -322,7 +375,7 @@ async function handleCategoryProducts(req, res) {
   await withJob(res, `category_products`, () =>
     getCategoryProducts({
       cat_id: url.searchParams.get("cat_id") || "",
-      keyword: url.searchParams.get("keyword") || "",
+      keyword: url.searchParams.get("keyword") || "*",
       page: Number(url.searchParams.get("page") || 1),
       page_size: Number(url.searchParams.get("page_size") || 20),
       sort: url.searchParams.get("sort") || "default",
@@ -331,19 +384,87 @@ async function handleCategoryProducts(req, res) {
   );
 }
 
-async function handleImgConvert(req, res) {
+async function handleCrossSearchItems(req, res) {
   if (req.method !== "GET") {
-    sendTmapi(res, tmapiError(405, "Use GET /1688/tools/img_convert?..."));
+    sendTmapi(res, tmapiError(405, "Use GET /1688/search/items/v2?..."));
     return;
   }
   const url = new URL(req.url, `http://${req.headers.host}`);
-  sendTmapi(
-    res,
-    convertImageUrl(url.searchParams.get("img_url") || "", {
-      width: url.searchParams.get("width"),
-      height: url.searchParams.get("height"),
+  await withJob(res, `cross_search_items`, () =>
+    searchItemsCrossBorder({
+      keyword: url.searchParams.get("keyword") || "",
+      cat_id: url.searchParams.get("cat_id") || "",
+      page: Number(url.searchParams.get("page") || 1),
+      page_size: Number(url.searchParams.get("page_size") || 20),
+      sort: url.searchParams.get("sort") || "default",
+      language: normalizeLanguage(url.searchParams.get("language") || "en"),
     })
   );
+}
+
+async function handleCrossSearchImage(req, res) {
+  let img_url = "";
+  let page = 1;
+  let page_size = 20;
+  let language = "en";
+  let sort = "default";
+
+  if (req.method === "GET") {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    img_url = url.searchParams.get("img_url") || "";
+    page = Number(url.searchParams.get("page") || 1);
+    page_size = Number(url.searchParams.get("page_size") || 20);
+    language = normalizeLanguage(url.searchParams.get("language") || "en");
+    sort = url.searchParams.get("sort") || "default";
+  } else if (req.method === "POST") {
+    const body = await readJsonBody(req);
+    if (body == null) {
+      sendTmapi(res, tmapiError(422, "Invalid JSON body"));
+      return;
+    }
+    img_url = body.img_url || body.url || "";
+    page = Number(body.page || 1);
+    page_size = Number(body.page_size || 20);
+    language = normalizeLanguage(body.language || "en");
+    sort = body.sort || "default";
+  } else {
+    sendTmapi(res, tmapiError(405, "Use GET/POST global search image"));
+    return;
+  }
+
+  await withJob(res, `cross_search_img`, () =>
+    searchByImageCrossBorder({ img_url, page, page_size, language, sort })
+  );
+}
+
+async function handleImgConvert(req, res) {
+  if (req.method === "GET") {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    sendTmapi(
+      res,
+      convertImageUrl(url.searchParams.get("img_url") || url.searchParams.get("url") || "", {
+        width: url.searchParams.get("width"),
+        height: url.searchParams.get("height"),
+      })
+    );
+    return;
+  }
+  if (req.method === "POST") {
+    const body = await readJsonBody(req);
+    if (body == null) {
+      sendTmapi(res, tmapiError(422, "Invalid JSON body"));
+      return;
+    }
+    sendTmapi(
+      res,
+      convertImageUrl(body.url || body.img_url || "", {
+        width: body.width,
+        height: body.height,
+      })
+    );
+    return;
+  }
+  sendTmapi(res, tmapiError(405, "Use GET/POST image convert"));
 }
 
 async function handleParseUrl(req, res) {
@@ -411,6 +532,7 @@ async function handleLegacySearch(req, res) {
 }
 
 const ROUTES = [
+  // Item APIs
   ["/1688/v2/item_detail", handleItemDetail],
   ["/api/1688/v2/item_detail", handleItemDetail],
   ["/1688/v2/item_detail_by_url", handleItemDetailByUrl],
@@ -418,20 +540,49 @@ const ROUTES = [
   ["/1688/item_desc", handleItemDesc],
   ["/1688/item_review", handleItemReview],
   ["/1688/item_reviews", handleItemReview],
+  ["/1688/v2/item_review", handleItemReview],
   ["/1688/item_freight", handleItemFreight],
+  ["/1688/v2/item_freight", handleItemFreight],
+
+  // Search APIs
   ["/1688/search/items", handleSearchItems],
+  ["/1688/search/items/v2", handleCrossSearchItems],
   ["/1688/v2/search/items", handleSearchItems],
+  ["/1688/search/image", handleSearchImage],
   ["/1688/search/img", handleSearchImage],
+  ["/1688/search/factory", handleSearchFactory],
+  ["/1688/search/factories", handleSearchFactory],
+
+  // Cross-border APIs
+  ["/1688/global/search/image", handleCrossSearchImage],
+  ["/1688/global/search/image/v2", handleCrossSearchImage],
+  ["/1688/cross/search/items", handleCrossSearchItems],
+  ["/1688/cross/search/image", handleCrossSearchImage],
+  ["/1688/cross/search/image/v2", handleCrossSearchImage],
+
+  // Shop APIs
+  ["/1688/shop/items", handleShopItems],
   ["/1688/shop/items/v2", handleShopItems],
   ["/1688/shop/info", handleShopInfo],
+  ["/1688/shop/shop_info", handleShopInfo],
   ["/1688/shop/cats", handleShopCats],
   ["/1688/shop/categories", handleShopCats],
+
+  // Category APIs
+  ["/1688/category/info", handleCategoryInfo],
+  ["/1688/v2/category/info", handleCategoryInfo],
   ["/1688/category/products", handleCategoryProducts],
   ["/1688/category/products/v2", handleCategoryProducts],
+  ["/1688/category/get_category_items", handleCategoryProducts],
+
+  // Tools
+  ["/1688/img/convert", handleImgConvert],
   ["/1688/tools/img_convert", handleImgConvert],
   ["/1688/img_convert", handleImgConvert],
   ["/tools/parse/url", handleParseUrl],
   ["/1688/tools/parse_url", handleParseUrl],
+
+  // Legacy
   ["/api/scrape", handleLegacyScrape],
   ["/api/search", handleLegacySearch],
 ];
