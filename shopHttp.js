@@ -468,17 +468,16 @@ export async function fetchShopItemsHttp(
   const currentPage = Math.max(1, Number(page) || 1);
   const size = Math.min(50, Math.max(1, Number(pageSize) || 20));
   return withShopClient(async (context, deadline) => {
-    // Fetch a one-item lookahead from page one whenever the requested window
-    // fits upstream's reliable 100-card limit. This gives exact page offsets
-    // and has-next without a second network round trip.
-    const windowSize = currentPage * size + 1;
-    const canUseWindow = windowSize <= 100;
+    // Ask 1688 for the requested upstream page directly. Large page-one
+    // windows are not reliable in production: the service may silently cap
+    // them, which made later logical pages empty or repeat page one.
+    const requestedSize = Math.min(50, size + 1);
     const html = await fetchOfferListPage(
       context,
       {
         memberId,
-        pageIndex: canUseWindow ? 1 : currentPage,
-        pageSize: canUseWindow ? windowSize : size,
+        pageIndex: currentPage,
+        pageSize: requestedSize,
         categoryId,
         sort,
         priceStart,
@@ -488,17 +487,12 @@ export async function fetchShopItemsHttp(
       deadline
     );
     const parsed = parseShopItemsHtml(html);
-    if (!parsed.length && currentPage === 1) {
+    if (!parsed.length) {
       throw shopHttpError("Shop offer list contained no usable products");
     }
-    const offset = canUseWindow ? (currentPage - 1) * size : 0;
-    const items = parsed.slice(offset, offset + size);
-    const hasNext = canUseWindow
-      ? parsed.length > offset + size
-      : parsed.length >= size;
-    const totalCount = canUseWindow && parsed.length < windowSize
-      ? parsed.length
-      : (currentPage - 1) * size + items.length + (hasNext ? 1 : 0);
+    const items = parsed.slice(0, size);
+    const hasNext = parsed.length > size;
+    const totalCount = (currentPage - 1) * size + items.length + (hasNext ? 1 : 0);
     return { items, totalCount, hasNext };
   }, options);
 }

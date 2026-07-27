@@ -119,9 +119,9 @@ const directItems = await fetchShopItemsHttp(
     }),
   }
 );
-assert.equal(requestedOfferUrl.searchParams.get("pageIndex"), "1");
-assert.equal(requestedOfferUrl.searchParams.get("pageSize"), "5");
-assert.deepEqual(directItems.items.map((item) => item.item_id), ["100000003", "100000004"]);
+assert.equal(requestedOfferUrl.searchParams.get("pageIndex"), "2");
+assert.equal(requestedOfferUrl.searchParams.get("pageSize"), "3");
+assert.deepEqual(directItems.items.map((item) => item.item_id), ["100000001", "100000002"]);
 assert.equal(directItems.totalCount, 5);
 assert.equal(directItems.hasNext, true);
 
