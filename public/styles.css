@@ -43,9 +43,66 @@ body {
   width: min(1180px, calc(100% - 2rem));
 }
 
+.token-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.85rem;
+  align-items: end;
+  margin-top: 1.6rem;
+  padding: 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(8, 18, 12, 0.45);
+  backdrop-filter: blur(10px);
+}
+
+.token-field {
+  display: grid;
+  grid-template-columns: auto minmax(12rem, 1fr);
+  gap: 0.35rem 0.8rem;
+  align-items: center;
+  min-width: 0;
+}
+
+.token-field > span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.token-field input {
+  width: 100%;
+  min-width: 0;
+  padding: 0.72rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  outline: 0;
+  background: rgba(5, 14, 9, 0.55);
+  color: var(--ink);
+  font: 500 0.95rem/1.2 var(--mono);
+}
+
+.token-field input:focus-visible {
+  border-color: rgba(214, 255, 75, 0.75);
+  box-shadow: 0 0 0 3px rgba(214, 255, 75, 0.12);
+}
+
+.token-field small {
+  grid-column: 2;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.token-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
 .workspace {
   display: grid;
-  grid-template-columns: 240px minmax(0, 1fr);
+  grid-template-columns: minmax(220px, 260px) minmax(0, 1fr);
   gap: 1.25rem;
   margin-top: 1.75rem;
   align-items: start;
@@ -98,7 +155,7 @@ body {
 
 .api-form {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  grid-template-columns: repeat(12, minmax(0, 1fr));
   gap: 0.75rem;
   margin-top: 0.85rem;
   padding: 0.85rem;
@@ -110,12 +167,19 @@ body {
   align-items: end;
 }
 
+.api-form > .field,
+.api-form > .check-field {
+  grid-column: span 4;
+}
+
 .api-form .field.grow {
   grid-column: 1 / -1;
 }
 
 .api-form .submit-btn {
+  grid-column: span 4;
   justify-self: stretch;
+  min-height: 3.2rem;
 }
 
 .api-form select {
@@ -193,7 +257,7 @@ h1 {
   color: var(--accent-ink);
 }
 
-.search {
+.search:not(.api-form) {
   display: grid;
   grid-template-columns: 1fr auto;
   gap: 0.75rem;
@@ -271,6 +335,17 @@ h1 {
   font: 500 1.25rem/1.2 var(--mono);
 }
 
+.field:focus-within {
+  border-radius: 10px;
+  background: rgba(214, 255, 75, 0.045);
+  box-shadow: inset 0 0 0 1px rgba(214, 255, 75, 0.25);
+}
+
+.field select option {
+  background: var(--bg0);
+  color: var(--ink);
+}
+
 .field input::placeholder {
   color: rgba(183, 199, 187, 0.45);
 }
@@ -279,6 +354,13 @@ button {
   border: 0;
   cursor: pointer;
   font: 600 1rem/1 var(--sans);
+}
+
+button:focus-visible,
+select:focus-visible,
+input:focus-visible {
+  outline: 3px solid rgba(214, 255, 75, 0.75);
+  outline-offset: 2px;
 }
 
 .submit-btn {
@@ -331,6 +413,41 @@ body.is-loading .btn-spinner {
 
 .status.is-error {
   color: var(--danger);
+}
+
+.request-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.65rem;
+  margin: 0.9rem 0 0;
+}
+
+.request-metrics[hidden] {
+  display: none;
+}
+
+.request-metrics > div {
+  min-width: 0;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(8, 18, 12, 0.38);
+}
+
+.request-metrics dt {
+  color: var(--muted);
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.request-metrics dd {
+  margin: 0.3rem 0 0;
+  overflow: hidden;
+  color: var(--ink);
+  font: 500 0.82rem/1.35 var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .panel {
@@ -469,7 +586,31 @@ body.is-loading .btn-spinner {
   .api-nav {
     position: static;
     max-height: none;
-    grid-template-columns: 1fr 1fr;
+    display: flex;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    scroll-snap-type: inline proximity;
+  }
+
+  .api-link {
+    flex: 0 0 min(19rem, 82vw);
+    scroll-snap-align: start;
+  }
+}
+
+@media (max-width: 1050px) {
+  .api-form > .field,
+  .api-form > .check-field,
+  .api-form .submit-btn {
+    grid-column: span 6;
+  }
+
+  .api-form .field.grow {
+    grid-column: 1 / -1;
+  }
+
+  .request-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -478,7 +619,7 @@ body.is-loading .btn-spinner {
     padding-top: 2rem;
   }
 
-  .search,
+  .search:not(.api-form),
   #search-form,
   .search-form,
   .offer-form,
@@ -487,8 +628,11 @@ body.is-loading .btn-spinner {
     grid-template-columns: 1fr;
   }
 
-  .api-nav {
-    grid-template-columns: 1fr;
+  .api-form > .field,
+  .api-form > .check-field,
+  .api-form .field.grow,
+  .api-form .submit-btn {
+    grid-column: 1;
   }
 
   .submit-btn {
@@ -497,5 +641,33 @@ body.is-loading .btn-spinner {
 
   .summary {
     grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 560px) {
+  .shell,
+  .shell-wide {
+    width: min(100% - 1rem, 1180px);
+  }
+
+  .token-bar {
+    grid-template-columns: 1fr;
+  }
+
+  .token-field {
+    grid-template-columns: 1fr;
+  }
+
+  .token-field small {
+    grid-column: 1;
+  }
+
+  .token-actions .ghost {
+    flex: 1;
+  }
+
+  .request-metrics,
+  .summary {
+    grid-template-columns: 1fr;
   }
 }

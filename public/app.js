@@ -7,6 +7,7 @@ const DEFAULT_IMG =
   "https://cbu01.alicdn.com/img/ibank/O1CN01AN5iRY1QvSD0m86OZ_!!2218225422038-0-cib.jpg";
 const DEFAULT_KEYWORD = "armrest pad";
 const DEFAULT_CAT = "122234002";
+const TOKEN_STORAGE_KEY = "1688-tester-api-token";
 
 const LANG = {
   name: "language",
@@ -261,6 +262,14 @@ const resultTitle = document.getElementById("result-title");
 const resultSub = document.getElementById("result-sub");
 const copyBtn = document.getElementById("copy-btn");
 const downloadBtn = document.getElementById("download-btn");
+const tokenInput = document.getElementById("api-token");
+const tokenToggle = document.getElementById("token-toggle");
+const tokenClear = document.getElementById("token-clear");
+const requestMetrics = document.getElementById("request-metrics");
+const metricDuration = document.getElementById("metric-duration");
+const metricHttp = document.getElementById("metric-http");
+const metricCache = document.getElementById("metric-cache");
+const metricPath = document.getElementById("metric-path");
 
 let current = APIS[0];
 let latestJson = "";
@@ -297,6 +306,44 @@ function setLoading(loading) {
   const btn = form.querySelector(".submit-btn");
   if (btn) btn.disabled = loading;
   for (const el of form.querySelectorAll("input,select")) el.disabled = loading;
+}
+
+function loadStoredToken() {
+  try {
+    return sessionStorage.getItem(TOKEN_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function storeToken(value) {
+  try {
+    if (value) sessionStorage.setItem(TOKEN_STORAGE_KEY, value);
+    else sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+  } catch {
+    // Storage can be unavailable in hardened/private browser contexts.
+  }
+}
+
+function requestHeaders(additional = {}) {
+  return {
+    ...additional,
+    "X-API-Token": tokenInput.value.trim(),
+  };
+}
+
+function formatDuration(durationMs) {
+  if (!Number.isFinite(durationMs)) return "—";
+  if (durationMs < 1_000) return `${Math.round(durationMs)} ms`;
+  return `${(durationMs / 1_000).toFixed(2)} s`;
+}
+
+function showRequestMetrics({ durationMs, httpStatus, cache, path }) {
+  metricDuration.textContent = formatDuration(durationMs);
+  metricHttp.textContent = httpStatus == null ? "Network error" : String(httpStatus);
+  metricCache.textContent = cache || "Not reported";
+  metricPath.textContent = path || "Not reported";
+  requestMetrics.hidden = false;
 }
 
 function renderNav() {
@@ -444,16 +491,18 @@ function showResult(data) {
 async function runCurrent(event) {
   event.preventDefault();
   const values = collectValues();
+  const startedAt = performance.now();
   setLoading(true);
   setStatus(`Running ${current.label}…`);
   panel.hidden = true;
+  requestMetrics.hidden = true;
 
   try {
     let res;
     if (current.method === "POST") {
       res = await fetch(current.path, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: requestHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify(values),
       });
     } else {
@@ -462,21 +511,58 @@ async function runCurrent(event) {
         if (typeof v === "boolean") params.set(k, v ? "true" : "false");
         else if (v !== "") params.set(k, v);
       }
-      res = await fetch(`${current.path}?${params}`);
+      res = await fetch(`${current.path}?${params}`, {
+        headers: requestHeaders(),
+      });
     }
     const data = await res.json();
+    const durationMs = performance.now() - startedAt;
+    showRequestMetrics({
+      durationMs,
+      httpStatus: res.status,
+      cache: res.headers.get("X-Scraper-Cache"),
+      path: res.headers.get("X-Scraper-Path"),
+    });
     showResult(data);
     if (data.code != null && data.code !== 200) {
       setStatus(data.msg || "Request failed.", true);
     } else {
-      setStatus("Done.");
+      setStatus(`Done in ${formatDuration(durationMs)}.`);
     }
   } catch (err) {
-    setStatus(err.message || "Network error.", true);
+    const durationMs = performance.now() - startedAt;
+    showRequestMetrics({ durationMs, httpStatus: null, cache: "", path: "" });
+    setStatus(
+      `${err.message || "Network error."} (${formatDuration(durationMs)})`,
+      true
+    );
   } finally {
     setLoading(false);
   }
 }
+
+tokenInput.value = loadStoredToken();
+tokenInput.addEventListener("input", () => {
+  storeToken(tokenInput.value);
+});
+
+tokenToggle.addEventListener("click", () => {
+  const willShow = tokenInput.type === "password";
+  tokenInput.type = willShow ? "text" : "password";
+  tokenToggle.textContent = willShow ? "Hide" : "Show";
+  tokenToggle.setAttribute("aria-pressed", String(willShow));
+  tokenInput.focus({ preventScroll: true });
+});
+
+tokenClear.addEventListener("click", () => {
+  tokenInput.value = "";
+  tokenInput.type = "password";
+  tokenToggle.textContent = "Show";
+  tokenToggle.setAttribute("aria-pressed", "false");
+  storeToken("");
+  tokenInput.focus({ preventScroll: true });
+  setStatus("API token cleared from this tab.");
+});
 
 copyBtn.addEventListener("click", async () => {
   if (!latestJson) return;

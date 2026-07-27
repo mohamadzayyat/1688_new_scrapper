@@ -23,13 +23,66 @@
         </p>
       </header>
 
+      <section class="token-bar" aria-labelledby="token-title">
+        <label class="token-field" for="api-token">
+          <span id="token-title">API token</span>
+          <input
+            id="api-token"
+            type="password"
+            inputmode="text"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+            placeholder="Paste API token"
+            aria-describedby="token-help"
+            data-1p-ignore
+          />
+          <small id="token-help">Saved in this tab only and sent as an HTTP header.</small>
+        </label>
+        <div class="token-actions">
+          <button
+            type="button"
+            class="ghost"
+            id="token-toggle"
+            aria-controls="api-token"
+            aria-pressed="false"
+          >
+            Show
+          </button>
+          <button type="button" class="ghost" id="token-clear">Clear</button>
+        </div>
+      </section>
+
       <div class="workspace">
         <aside class="api-nav" id="api-nav" aria-label="APIs"></aside>
 
         <main class="api-main">
           <p class="endpoint" id="endpoint-hint"></p>
-          <form id="api-form" class="search api-form" autocomplete="off"></form>
+          <form id="api-form" class="api-form" autocomplete="off"></form>
           <p id="status" class="status" role="status" aria-live="polite"></p>
+          <dl
+            class="request-metrics"
+            id="request-metrics"
+            aria-label="Request performance"
+            hidden
+          >
+            <div>
+              <dt>Duration</dt>
+              <dd id="metric-duration">—</dd>
+            </div>
+            <div>
+              <dt>HTTP</dt>
+              <dd id="metric-http">—</dd>
+            </div>
+            <div>
+              <dt>Cache</dt>
+              <dd id="metric-cache">—</dd>
+            </div>
+            <div>
+              <dt>Scraper path</dt>
+              <dd id="metric-path">—</dd>
+            </div>
+          </dl>
 
           <section class="panel" id="result-panel" hidden>
             <div class="panel-bar">
