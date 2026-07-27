@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "provider": "dataimpulse",
+  "proxyUrl": "http://USER:PASS@gw.dataimpulse.com:823"
+}

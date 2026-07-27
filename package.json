@@ -1,0 +1,22 @@
+{
+  "name": "1688-scraper",
+  "version": "1.0.0",
+  "description": "Scrape a 1688 product by offer ID and output JSON",
+  "type": "module",
+  "bin": {
+    "1688-scrape": "./cli.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "scrape": "node cli.js",
+    "search": "node cli.js --search",
+    "login": "node cli.js --login",
+    "postinstall": "npx playwright install chromium"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "playwright": "^1.54.1"
+  }
+}

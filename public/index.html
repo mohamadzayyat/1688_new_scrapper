@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>1688 Scraper · TMAPI Tester</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="shell shell-wide">
+      <header class="hero">
+        <p class="brand">1688 Scraper</p>
+        <h1>TMAPI tester</h1>
+        <p class="lede">
+          Local drop-in endpoints matching TMAPI response shapes. Default language is
+          <strong>en</strong>. Each API has a sample value ready to run.
+        </p>
+      </header>
+
+      <div class="workspace">
+        <aside class="api-nav" id="api-nav" aria-label="APIs"></aside>
+
+        <main class="api-main">
+          <p class="endpoint" id="endpoint-hint"></p>
+          <form id="api-form" class="search api-form" autocomplete="off"></form>
+          <p id="status" class="status" role="status" aria-live="polite"></p>
+
+          <section class="panel" id="result-panel" hidden>
+            <div class="panel-bar">
+              <div class="panel-meta">
+                <strong id="result-title">Result</strong>
+                <span id="result-sub"></span>
+              </div>
+              <div class="panel-actions">
+                <button type="button" class="ghost" id="copy-btn">Copy JSON</button>
+                <button type="button" class="ghost" id="download-btn">Download</button>
+              </div>
+            </div>
+            <div class="summary" id="summary" hidden></div>
+            <pre class="json" id="json-view"></pre>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
