@@ -20,7 +20,7 @@ const REVIEW_SUMMARY_API =
 const FREIGHT_API = "mtop.1688.freightInfoService.getFreightInfoWithScene";
 const IMAGE_SEARCH_API = "mtop.relationrecommend.WirelessRecommend.recommend";
 const MAX_RESPONSE_BYTES = 4_000_000;
-// Live list behavior uses 15-row batches at upstream indexes 1, 3, 5, ... .
+// Live list behavior uses 10-row batches at upstream indexes 1, 3, 5, ... .
 // Even indexes expose only the overlapping tail of the preceding batch.
 const REVIEW_BATCH_SIZE = 10;
 const REVIEW_PAGE_STEP = 2;
@@ -30,7 +30,7 @@ const CACHE_TTL_MS = Math.max(
 );
 const EXTRA_BUDGET_MS = Math.max(
   8_000,
-  Math.min(30_000, Number(process.env.MOBILE_EXTRA_BUDGET_MS) || 24_000)
+  Math.min(30_000, Number(process.env.MOBILE_EXTRA_BUDGET_MS) || 30_000)
 );
 const FREIGHT_BREAKER_MS = Math.max(
   15_000,
