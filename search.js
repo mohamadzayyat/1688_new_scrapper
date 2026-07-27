@@ -2,6 +2,11 @@ import { assertAuthLooksValid, newAuthedContext } from "./auth.js";
 import { launchBrowser, acquirePooledBrowser, releaseBrowser } from "./browser.js";
 import { proxyStatus } from "./proxy.js";
 import {
+  fetchMobileSearchPage,
+  mobileSearchWindow,
+} from "./mobileSearch.js";
+import { currentJobSignal, jobAbortError } from "./jobContext.js";
+import {
   markIfTranslationIncomplete,
   normalizeLang,
   translateTexts,
@@ -31,6 +36,102 @@ function stripHtml(value) {
     .replace(/<[^>]+>/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function numericOfferValue(value) {
+  const match = String(value ?? "").replace(/,/g, "").match(/\d+(?:\.\d+)?/);
+  const number = match ? Number(match[0]) : null;
+  return Number.isFinite(number) ? number : null;
+}
+
+function filterAndSortSearchItems(
+  items,
+  { sort = "default", priceStart = "", priceEnd = "" } = {}
+) {
+  const minPrice = priceStart !== "" ? Number(priceStart) : null;
+  const maxPrice = priceEnd !== "" ? Number(priceEnd) : null;
+  let output = [...items];
+  if (Number.isFinite(minPrice)) {
+    output = output.filter((item) => (numericOfferValue(item.price) ?? -1) >= minPrice);
+  }
+  if (Number.isFinite(maxPrice)) {
+    output = output.filter((item) => {
+      const price = numericOfferValue(item.price);
+      return price != null && price <= maxPrice;
+    });
+  }
+  const normalized = String(sort || "default").trim().toLowerCase().replace(/-/g, "_");
+  if (["price_up", "priceup", "price_asc"].includes(normalized)) {
+    output.sort((left, right) =>
+      (numericOfferValue(left.price) ?? Number.POSITIVE_INFINITY) -
+      (numericOfferValue(right.price) ?? Number.POSITIVE_INFINITY)
+    );
+  } else if (["price_down", "pricedown", "price_desc"].includes(normalized)) {
+    output.sort((left, right) =>
+      (numericOfferValue(right.price) ?? Number.NEGATIVE_INFINITY) -
+      (numericOfferValue(left.price) ?? Number.NEGATIVE_INFINITY)
+    );
+  }
+  return output;
+}
+
+async function tryHttpSearch(keyword, pageNo, pageSize, deadline, filters) {
+  const window = mobileSearchWindow(pageNo, pageSize);
+  const normalizedSort = String(filters.sort || "default")
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, "_");
+  const needsFullPriceUniverse =
+    filters.priceStart !== "" ||
+    filters.priceEnd !== "" ||
+    ["price_up", "priceup", "price_asc", "price_down", "pricedown", "price_desc"].includes(
+      normalizedSort
+    );
+  const pages = needsFullPriceUniverse
+    ? [1, 2, 3]
+    : Array.from(
+        { length: window.upstreamPageCount },
+        (_, index) => window.firstUpstreamPage + index
+      );
+  const batches = await Promise.all(
+    pages.map((upstreamPage) =>
+      fetchMobileSearchPage({
+        keyword,
+        upstreamPage,
+        // Keep both price directions over one canonical upstream universe.
+        sort: "default",
+        priceStart: filters.priceStart,
+        priceEnd: filters.priceEnd,
+        deadline,
+      })
+    )
+  );
+  const seen = new Set();
+  const combined = [];
+  for (const batch of batches) {
+    for (const item of batch.items) {
+      if (seen.has(item.offerId)) continue;
+      seen.add(item.offerId);
+      combined.push(item);
+    }
+  }
+  const upstreamTotal = batches.find((batch) => Number.isFinite(batch.total))?.total ?? null;
+  if (needsFullPriceUniverse) {
+    const filtered = filterAndSortSearchItems(combined, filters);
+    const exhaustive = Number.isFinite(upstreamTotal)
+      ? pages.length * 20 >= upstreamTotal
+      : batches.some((batch) => batch.items.length < 20);
+    return {
+      source: "mobile-http",
+      total: exhaustive ? filtered.length : upstreamTotal,
+      items: filtered.slice(window.offset, window.end),
+    };
+  }
+  return {
+    source: "mobile-http",
+    total: upstreamTotal,
+    items: combined.slice(window.sliceStart, window.sliceStart + pageSize),
+  };
 }
 
 function keywordToHexPath(keyword) {
@@ -226,7 +327,7 @@ async function scrapeMobileSearch(
     await withLangCookies(context, lang);
     const page = await context.newPage();
     await page.goto(buildMobileSearchUrl(keyword, pageNo, filters), {
-      waitUntil: "domcontentloaded",
+      waitUntil: "commit",
       timeout: remainingTimeout(deadline, 15_000),
     });
 
@@ -288,9 +389,11 @@ async function scrapeMobileSearch(
           .split("\n")
           .map((s) => s.trim())
           .filter(Boolean);
-        const img = a.querySelector(
-          "img.image_src[data-src], img[data-src], img.image_src, img"
-        );
+        const images = [...a.querySelectorAll("img")];
+        const img =
+          images.find((node) =>
+            node.matches("img.image_src[data-src], img.image_src[src], img[data-src]")
+          ) || images.find((node) => node.getAttribute("src"));
         let image = img?.getAttribute("data-src") || img?.getAttribute("src") || null;
         if (image && /offer_search|data:image|spacer|blank/i.test(image)) {
           image = null;
@@ -298,23 +401,38 @@ async function scrapeMobileSearch(
 
         items.push({
           offerId,
-          title: lines[0] || img?.alt || null,
-          price: (text.match(/￥\s*([\d.]+)/) || [])[1] || null,
-          sales: (text.match(/成交\s*([^\n]+)/) || [])[1] || null,
-          repurchaseRate: (text.match(/复购率[:：]\s*([^\n]+)/) || [])[1] || null,
+          title:
+            (a.querySelector(".item-info_title")?.textContent || "").trim() ||
+            img?.alt ||
+            lines[0] ||
+            null,
+          price:
+            ((a.querySelector(".count_price")?.textContent || text).match(
+              /[￥¥]\s*([\d.]+)/u
+            ) || [])[1] || null,
+          sales:
+            (a.querySelector(".count_vol")?.textContent || "")
+              .replace(/^\s*成交\s*/u, "")
+              .trim() || null,
+          repurchaseRate:
+            (a.querySelector(".percent-re-purchase")?.textContent || "")
+              .replace(/^\s*复购率\s*[:：]?\s*/u, "")
+              .trim() || null,
           company: null,
           location:
-            lines.find((line) => /市$|省$|区$/.test(line) && line.length <= 12) ||
-            null,
+            (a.querySelector(".count_position")?.textContent || "").trim() || null,
           image,
           url: `https://detail.1688.com/offer/${offerId}.html`,
-          tags: lines.filter((l) => /热销|验厂|包邮|代发|包换/.test(l)).slice(0, 5),
+          tags: [...a.querySelectorAll(".info-tag")]
+            .map((node) => (node.textContent || "").trim())
+            .filter(Boolean)
+            .slice(0, 5),
           isAd: false,
         });
       }
 
-      const totalRaw = (document.body.innerText.match(/共\s*([\d,+]+)\s*件/) || [])[1];
-      const total = totalRaw ? Number(String(totalRaw).replace(/[,，]/g, "")) : null;
+      const totalRaw = (document.body.innerText.match(/共\s*([\d,，+]+)\s*件/u) || [])[1];
+      const total = totalRaw ? Number(String(totalRaw).replace(/[,，+]/gu, "")) : null;
 
       return { source: "mobile", total, items };
     });
@@ -360,9 +478,14 @@ export async function searchOffers(
     );
   }
 
-  const browser = headed
-    ? await launchBrowser({ headed: true })
-    : await acquirePooledBrowser();
+  let browser = null;
+  const ensureBrowser = async () => {
+    if (browser) return browser;
+    browser = headed
+      ? await launchBrowser({ headed: true })
+      : await acquirePooledBrowser();
+    return browser;
+  };
 
   try {
     let lastError;
@@ -371,10 +494,28 @@ export async function searchOffers(
       try {
         let raw = null;
 
+        if (proxy.enabled && !headed) {
+          try {
+            raw = await tryHttpSearch(
+              q,
+              pageNo,
+              requestedPageSize,
+              deadline,
+              filters
+            );
+          } catch (error) {
+            const signal = currentJobSignal();
+            if (signal?.aborted || error?.cancelled || error?.code === 499) {
+              throw jobAbortError(signal);
+            }
+          }
+        }
+
         // Desktop JSON is richest when session works.
-        if (auth.ok) {
+        if (!raw && auth.ok) {
+          const activeBrowser = await ensureBrowser();
           const desktop = await tryDesktopSearch(
-            browser,
+            activeBrowser,
             q,
             pageNo,
             language,
@@ -391,8 +532,9 @@ export async function searchOffers(
         }
 
         if (!raw) {
+          const activeBrowser = await ensureBrowser();
           raw = await scrapeMobileSearch(
-            browser,
+            activeBrowser,
             q,
             pageNo,
             language,
@@ -408,8 +550,12 @@ export async function searchOffers(
           language
         );
 
-        const pageSize = results.length;
-        const total = Number.isFinite(raw.total) ? raw.total : null;
+        const pageSize = requestedPageSize;
+        const logicalOffset = (pageNo - 1) * requestedPageSize;
+        const observedEnd = logicalOffset + results.length;
+        const total = Number.isFinite(raw.total)
+          ? Math.max(raw.total, observedEnd)
+          : observedEnd + (results.length === requestedPageSize ? 1 : 0);
         const totalPages =
           total && pageSize ? Math.max(1, Math.ceil(total / pageSize)) : null;
 
@@ -452,7 +598,7 @@ export async function searchOffers(
 
     throw lastError;
   } finally {
-    if (headed) await browser.close().catch(() => {});
-    else releaseBrowser(browser);
+    if (browser && headed) await browser.close().catch(() => {});
+    else if (browser) releaseBrowser(browser);
   }
 }

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { __extendCategoryMergeState } from "../extraScrape.js";
+import {
+  __extendCategoryMergeState,
+  getCategoryProducts,
+} from "../extraScrape.js";
 
 function makeState(sources, chunkSize = 7) {
   const streams = sources.map((source, index) => ({
@@ -64,5 +67,11 @@ assert.deepEqual(
 );
 assert.equal(duplicates.exhausted, true);
 assert.equal(duplicates.seen.get("b").category_path.length, 2);
+
+const invalidCategory = await getCategoryProducts({
+  cat_id: "999999999999",
+  keyword: "*",
+});
+assert.equal(invalidCategory.code, 422, "oversized category ID reached upstream search");
 
 console.log("category merge pagination tests: OK");

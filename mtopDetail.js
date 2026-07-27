@@ -3,6 +3,7 @@ import { request } from "playwright";
 import { currentJobSignal, jobAbortError } from "./jobContext.js";
 import { parseMobileOfferInitFromHtml } from "./offerContext.js";
 import { getPlaywrightProxy } from "./proxy.js";
+import { mapMobileShipping } from "./mobileShipping.js";
 import { toTmapiItemDetail } from "./tmapiFormat.js";
 
 const MTOP_API = "mtop.1688.mmga.offerdetail.service";
@@ -510,7 +511,7 @@ export function mapMobileMtopToRaw(offerIdValue, mobileInit, mtopPayload) {
     productPackInfo: null,
     videoId: null,
     deliveryInfo: null,
-    shipping: null,
+    shipping: mapMobileShipping(mobileInit, offerId),
   };
   validateStrictDetail(raw, offerId, normalizedSku.hasVariants);
   return raw;
