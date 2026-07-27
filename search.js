@@ -3,8 +3,23 @@ import { launchBrowser, acquirePooledBrowser, releaseBrowser } from "./browser.j
 import { proxyStatus } from "./proxy.js";
 import { normalizeLang, translateTexts } from "./translate.js";
 
+const SEARCH_TIMEOUT_MS = Math.max(
+  10_000,
+  Number(process.env.SEARCH_TIMEOUT_MS) || 34_000
+);
+const SEARCH_ATTEMPTS = Math.max(
+  1,
+  Math.min(2, Number(process.env.SEARCH_ATTEMPTS) || 1)
+);
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function remainingTimeout(deadline, ceiling) {
+  const remaining = deadline - Date.now();
+  if (remaining < 1_000) throw new Error("Search deadline exceeded");
+  return Math.min(ceiling, remaining);
 }
 
 function stripHtml(value) {
@@ -79,11 +94,9 @@ async function withLangCookies(context, lang) {
   ]);
 }
 
-async function tryDesktopSearch(browser, keyword, pageNo, lang = "zh") {
+async function tryDesktopSearch(browser, keyword, pageNo, lang = "zh", deadline = Infinity) {
   const context = await newAuthedContext(browser, {
     locale: lang === "en" ? "en-US" : "zh-CN",
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     viewport: { width: 1440, height: 900 },
     extraHTTPHeaders: {
       "Accept-Language":
@@ -96,11 +109,11 @@ async function tryDesktopSearch(browser, keyword, pageNo, lang = "zh") {
     const page = await context.newPage();
     await page.goto(buildDesktopSearchUrl(keyword, pageNo), {
       waitUntil: "domcontentloaded",
-      timeout: 45_000,
+      timeout: remainingTimeout(deadline, 12_000),
     });
 
     const started = Date.now();
-    while (Date.now() - started < 12_000) {
+    while (Date.now() - started < 6_000 && Date.now() < deadline) {
       const state = await page.evaluate(() => {
         const href = location.href;
         const text = document.body?.innerText || "";
@@ -145,13 +158,11 @@ function loginHelpMessage() {
   );
 }
 
-async function scrapeMobileSearch(browser, keyword, pageNo, lang = "zh") {
+async function scrapeMobileSearch(browser, keyword, pageNo, lang = "zh", deadline = Infinity) {
   const context = await newAuthedContext(browser, {
     isMobile: true,
     hasTouch: true,
     locale: lang === "en" ? "en-US" : "zh-CN",
-    userAgent:
-      "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
     viewport: { width: 390, height: 844 },
     extraHTTPHeaders: {
       "Accept-Language":
@@ -164,12 +175,12 @@ async function scrapeMobileSearch(browser, keyword, pageNo, lang = "zh") {
     const page = await context.newPage();
     await page.goto(buildMobileSearchUrl(keyword, pageNo), {
       waitUntil: "domcontentloaded",
-      timeout: 60_000,
+      timeout: remainingTimeout(deadline, 15_000),
     });
 
     const started = Date.now();
     let ready = false;
-    while (Date.now() - started < 35_000) {
+    while (Date.now() - started < 12_000 && Date.now() < deadline) {
       const count = await page.locator("a.item-link").count();
       if (count > 0) {
         ready = true;
@@ -271,6 +282,7 @@ export async function searchOffers(
   { page = 1, headed = false, lang = "zh" } = {}
 ) {
   const startedAt = Date.now();
+  const deadline = startedAt + SEARCH_TIMEOUT_MS;
   const q = String(keyword || "").trim();
   const pageNo = Math.max(1, Number(page) || 1);
   const language = normalizeLang(lang);
@@ -293,13 +305,19 @@ export async function searchOffers(
   try {
     let lastError;
 
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    for (let attempt = 1; attempt <= SEARCH_ATTEMPTS; attempt++) {
       try {
         let raw = null;
 
         // Desktop JSON is richest when session works.
         if (auth.ok) {
-          const desktop = await tryDesktopSearch(browser, q, pageNo, language);
+          const desktop = await tryDesktopSearch(
+            browser,
+            q,
+            pageNo,
+            language,
+            deadline
+          );
           if (desktop?.items?.length) {
             raw = {
               source: "desktop",
@@ -310,7 +328,13 @@ export async function searchOffers(
         }
 
         if (!raw) {
-          raw = await scrapeMobileSearch(browser, q, pageNo, language);
+          raw = await scrapeMobileSearch(
+            browser,
+            q,
+            pageNo,
+            language,
+            deadline
+          );
         }
 
         if (!raw.items.length) throw new Error("Search returned zero offers");
@@ -354,7 +378,7 @@ export async function searchOffers(
         };
       } catch (err) {
         lastError = err;
-        if (attempt === 2) break;
+        if (attempt === SEARCH_ATTEMPTS || Date.now() >= deadline) break;
         await sleep(800);
       }
     }

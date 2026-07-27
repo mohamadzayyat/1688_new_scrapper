@@ -1,4 +1,5 @@
 import http from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,12 +24,26 @@ import {
 } from "./extraScrape.js";
 import { enqueueJob, jobQueueStats, recommendedHardware } from "./jobQueue.js";
 import { cacheKey, cached, cachedSwr, cacheStats } from "./cache.js";
-import { warmBrowserPool, browserPoolStats } from "./browser.js";
+import {
+  warmBrowserPool,
+  browserPoolStats,
+  closeBrowserPool,
+} from "./browser.js";
 import { assertAuthLooksValid } from "./auth.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const PUBLIC_DIR = join(__dirname, "public");
 const PORT = Number(process.env.PORT) || 3456;
+const HOST = process.env.HOST || "127.0.0.1";
+const REQUEST_TIMEOUT_MS = Math.max(
+  5_000,
+  Number(process.env.REQUEST_TIMEOUT_MS) || 40_000
+);
+const MAX_BODY_BYTES = Math.max(
+  1_024,
+  Number(process.env.MAX_BODY_BYTES) || 64 * 1024
+);
+const SCRAPER_API_TOKEN = String(process.env.SCRAPER_API_TOKEN || "").trim();
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -55,7 +70,8 @@ const META_CACHE_TTL = Math.max(
 );
 
 function sendJson(res, status, body) {
-  const payload = JSON.stringify(body, null, 2);
+  if (res.headersSent || res.writableEnded) return;
+  const payload = JSON.stringify(body);
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
@@ -95,23 +111,42 @@ async function serveStatic(req, res) {
  */
 async function withJob(res, label, fn, { tmapi = true, cacheTtl = 0, cacheParts = null, swr = false } = {}) {
   try {
-    const run = async () => {
-      if (cacheTtl > 0 && cacheParts) {
-        const key = cacheKey(cacheParts);
-        if (swr) return cachedSwr(key, cacheTtl, fn);
-        return cached(key, cacheTtl, fn);
-      }
-      return fn();
-    };
+    // Cache and singleflight are outside the scrape queue so memory/disk hits
+    // never wait behind Chromium work. Every miss and SWR refresh still enters
+    // the same bounded queue through `produce`.
+    const produce = () => enqueueJob(label, fn);
+    let work;
+    if (cacheTtl > 0 && cacheParts) {
+      const key = cacheKey(cacheParts);
+      work = swr
+        ? cachedSwr(key, cacheTtl, produce)
+        : cached(key, cacheTtl, produce);
+    } else {
+      work = produce();
+    }
 
-    const data = await enqueueJob(label, run);
+    let timer;
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const err = new Error(`Request exceeded ${REQUEST_TIMEOUT_MS}ms`);
+        err.code = 504;
+        reject(err);
+      }, REQUEST_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    const data = await Promise.race([work, deadline]).finally(() => clearTimeout(timer));
     if (tmapi) sendTmapi(res, data);
     else sendJson(res, 200, data);
   } catch (err) {
-    const code = err?.code === 439 || err?.queueFull ? 439 : 500;
+    const code =
+      err?.code === 439 || err?.queueFull
+        ? 439
+        : err?.code === 504
+          ? 504
+          : 500;
     const msg = err.message || "Request failed";
     if (tmapi) sendTmapi(res, tmapiError(code, msg));
-    else sendJson(res, code === 439 ? 429 : 502, { error: msg });
+    else sendJson(res, code === 439 ? 429 : code === 504 ? 504 : 502, { error: msg });
   }
 }
 
@@ -129,7 +164,22 @@ function extractOfferIdFromUrl(input) {
 
 async function readJsonBody(req) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  let bytes = 0;
+  const contentLength = Number(req.headers["content-length"] || 0);
+  if (contentLength > MAX_BODY_BYTES) {
+    const err = new Error(`JSON body exceeds ${MAX_BODY_BYTES} bytes`);
+    err.httpStatus = 413;
+    throw err;
+  }
+  for await (const chunk of req) {
+    bytes += chunk.length;
+    if (bytes > MAX_BODY_BYTES) {
+      const err = new Error(`JSON body exceeds ${MAX_BODY_BYTES} bytes`);
+      err.httpStatus = 413;
+      throw err;
+    }
+    chunks.push(chunk);
+  }
   const raw = Buffer.concat(chunks).toString("utf8").trim();
   if (!raw) return {};
   try {
@@ -153,7 +203,6 @@ async function handleItemDetail(req, res) {
   const language = normalizeLanguage(url.searchParams.get("language") || "en");
   const optimizeTitle = boolParam(url.searchParams.get("optimize_title"));
   void url.searchParams.get("scene");
-  void url.searchParams.get("apiToken");
 
   if (!/^\d+$/.test(itemId)) {
     sendTmapi(res, tmapiError(422, "item_id is required and must be a number"));
@@ -229,8 +278,15 @@ async function handleItemDesc(req, res) {
     sendTmapi(res, tmapiError(422, "item_id is required"));
     return;
   }
-  await withJob(res, `item_desc:${itemId}`, () =>
-    getItemDesc(itemId, { language })
+  await withJob(
+    res,
+    `item_desc:${itemId}:${language}`,
+    () => getItemDesc(itemId, { language }),
+    {
+      cacheTtl: ITEM_CACHE_TTL,
+      cacheParts: ["item_desc", itemId, language],
+      swr: true,
+    }
   );
 }
 
@@ -268,6 +324,15 @@ async function handleItemFreight(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const itemId = (url.searchParams.get("item_id") || "").trim();
   const language = normalizeLanguage(url.searchParams.get("language") || "en");
+  const province = (url.searchParams.get("province") || "").trim();
+  const totalQuantity = Math.max(
+    1,
+    Number(url.searchParams.get("total_quantity") || 1)
+  );
+  const totalWeight = Math.max(
+    0,
+    Number(url.searchParams.get("total_weight") || 0)
+  );
   if (!/^\d+$/.test(itemId)) {
     sendTmapi(res, tmapiError(422, "item_id is required"));
     return;
@@ -275,10 +340,23 @@ async function handleItemFreight(req, res) {
   await withJob(
     res,
     `item_freight:${itemId}`,
-    () => getItemFreight(itemId, { language }),
+    () =>
+      getItemFreight(itemId, {
+        language,
+        province,
+        total_quantity: totalQuantity,
+        total_weight: totalWeight,
+      }),
     {
       cacheTtl: LIST_CACHE_TTL,
-      cacheParts: ["item_freight", itemId, language],
+      cacheParts: [
+        "item_freight",
+        itemId,
+        language,
+        province,
+        totalQuantity,
+        totalWeight,
+      ],
       swr: true,
     }
   );
@@ -385,6 +463,25 @@ async function handleSearchFactory(req, res) {
   );
 }
 
+function tokenMatches(candidate) {
+  if (!SCRAPER_API_TOKEN || !candidate) return false;
+  const expected = Buffer.from(SCRAPER_API_TOKEN);
+  const actual = Buffer.from(String(candidate));
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+function requestIsAuthorized(req, url) {
+  if (!SCRAPER_API_TOKEN) return true;
+  const authorization = String(req.headers.authorization || "");
+  const bearer = authorization.match(/^Bearer\s+(.+)$/i)?.[1];
+  return tokenMatches(
+    req.headers["x-api-token"] ||
+      bearer ||
+      url.searchParams.get("apiToken") ||
+      url.searchParams.get("api_token")
+  );
+}
+
 async function handleShopItems(req, res) {
   if (req.method !== "GET") {
     sendTmapi(res, tmapiError(405, "Use GET /1688/shop/items or /1688/shop/items/v2"));
@@ -399,7 +496,13 @@ async function handleShopItems(req, res) {
       page_size: Number(url.searchParams.get("page_size") || 20),
       sort: url.searchParams.get("sort") || "default",
       keyword: url.searchParams.get("keyword") || "",
-      shop_cat_id: url.searchParams.get("shop_cat_id") || url.searchParams.get("cat") || "",
+      shop_cat_id:
+        url.searchParams.get("shop_cat_id") ||
+        url.searchParams.get("cat_id") ||
+        url.searchParams.get("cat") ||
+        "",
+      price_start: url.searchParams.get("price_start") || "",
+      price_end: url.searchParams.get("price_end") || "",
       language: normalizeLanguage(url.searchParams.get("language") || "en"),
     }),
     {
@@ -412,7 +515,11 @@ async function handleShopItems(req, res) {
         url.searchParams.get("page_size"),
         url.searchParams.get("sort"),
         url.searchParams.get("keyword"),
-        url.searchParams.get("shop_cat_id") || url.searchParams.get("cat"),
+        url.searchParams.get("shop_cat_id") ||
+          url.searchParams.get("cat_id") ||
+          url.searchParams.get("cat"),
+        url.searchParams.get("price_start"),
+        url.searchParams.get("price_end"),
         url.searchParams.get("language"),
       ],
       swr: true,
@@ -530,15 +637,29 @@ async function handleCrossSearchItems(req, res) {
     return;
   }
   const url = new URL(req.url, `http://${req.headers.host}`);
-  await withJob(res, `cross_search_items`, () =>
-    searchItemsCrossBorder({
-      keyword: url.searchParams.get("keyword") || "",
-      cat_id: url.searchParams.get("cat_id") || "",
-      page: Number(url.searchParams.get("page") || 1),
-      page_size: Number(url.searchParams.get("page_size") || 20),
-      sort: url.searchParams.get("sort") || "default",
-      language: normalizeLanguage(url.searchParams.get("language") || "en"),
-    })
+  const keyword = url.searchParams.get("keyword") || "";
+  const catId = url.searchParams.get("cat_id") || "";
+  const page = Number(url.searchParams.get("page") || 1);
+  const pageSize = Number(url.searchParams.get("page_size") || 20);
+  const sort = url.searchParams.get("sort") || "default";
+  const language = normalizeLanguage(url.searchParams.get("language") || "en");
+  await withJob(
+    res,
+    `cross_search_items:${keyword || catId}:${page}`,
+    () =>
+      searchItemsCrossBorder({
+        keyword,
+        cat_id: catId,
+        page,
+        page_size: pageSize,
+        sort,
+        language,
+      }),
+    {
+      cacheTtl: SEARCH_CACHE_TTL,
+      cacheParts: ["cross_search", keyword, catId, page, pageSize, sort, language],
+      swr: true,
+    }
   );
 }
 
@@ -572,8 +693,15 @@ async function handleCrossSearchImage(req, res) {
     return;
   }
 
-  await withJob(res, `cross_search_img`, () =>
-    searchByImageCrossBorder({ img_url, page, page_size, language, sort })
+  await withJob(
+    res,
+    `cross_search_img:${page}`,
+    () => searchByImageCrossBorder({ img_url, page, page_size, language, sort }),
+    {
+      cacheTtl: LIST_CACHE_TTL,
+      cacheParts: ["cross_search_image", img_url, page, page_size, language, sort],
+      swr: true,
+    }
   );
 }
 
@@ -679,6 +807,7 @@ const ROUTES = [
   ["/1688/global/item_detail", handleItemDetail],
   ["/api/1688/v2/item_detail", handleItemDetail],
   ["/1688/v2/item_detail_by_url", handleItemDetailByUrl],
+  ["/1688/item_detail_by_url", handleItemDetailByUrl],
   ["/api/1688/v2/item_detail_by_url", handleItemDetailByUrl],
   ["/1688/item_desc", handleItemDesc],
   ["/1688/item_review", handleItemReview],
@@ -721,6 +850,7 @@ const ROUTES = [
   ["/1688/category/products", handleCategoryProducts],
   ["/1688/category/items", handleCategoryProducts],
   ["/1688/category/products/v2", handleCategoryProducts],
+  ["/1688/category/items/v2", handleCategoryProducts],
   ["/1688/category/get_category_items", handleCategoryProducts],
 
   // Tools
@@ -740,13 +870,22 @@ async function handleHealth(_req, res) {
   const auth = await assertAuthLooksValid();
   sendJson(res, 200, {
     ok: true,
+    ready: auth.ok,
     auth,
+    security: { apiTokenRequired: Boolean(SCRAPER_API_TOKEN) },
     uptimeSec: Math.round(process.uptime()),
     queue: jobQueueStats(),
     browsers: browserPoolStats(),
     cache: cacheStats(),
     hardware: recommendedHardware(),
   });
+}
+
+async function handleReady(_req, res) {
+  const auth = await assertAuthLooksValid();
+  const browsers = browserPoolStats();
+  const ready = auth.ok && !browsers.closing && !browsers.closed;
+  sendJson(res, ready ? 200 : 503, { ready, auth, browsers });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -756,21 +895,39 @@ const server = http.createServer(async (req, res) => {
       await handleHealth(req, res);
       return;
     }
+    if (url.pathname === "/ready" || url.pathname === "/api/ready") {
+      await handleReady(req, res);
+      return;
+    }
     const hit = ROUTES.find(([path]) => url.pathname === path);
     if (hit) {
+      if (!requestIsAuthorized(req, url)) {
+        sendTmapi(res, tmapiError(401, "Invalid or missing API token"));
+        return;
+      }
       await hit[1](req, res);
       return;
     }
     await serveStatic(req, res);
   } catch (err) {
-    sendJson(res, 500, { error: err.message || "Server error" });
+    const status = Number(err?.httpStatus) || 500;
+    if (String(req.url || "").startsWith("/1688/")) {
+      sendTmapi(res, tmapiError(status, err.message || "Server error"));
+    } else {
+      sendJson(res, status, { error: err.message || "Server error" });
+    }
   }
 });
 
-server.listen(PORT, async () => {
+server.requestTimeout = REQUEST_TIMEOUT_MS + 5_000;
+server.headersTimeout = 10_000;
+server.keepAliveTimeout = 5_000;
+
+server.listen(PORT, HOST, async () => {
   console.log(`1688 scraper UI → http://localhost:${PORT}`);
   console.log(`Health → http://localhost:${PORT}/health`);
   console.log(`TMAPI routes mounted under /1688/...`);
+  console.log(`[security] API token ${SCRAPER_API_TOKEN ? "required" : "disabled"}`);
   const hw = recommendedHardware();
   console.log(
     `[capacity] maxConcurrent=${hw.maxConcurrent} maxQueue=${hw.maxQueue} (target ~${hw.targetUsers} users)`
@@ -780,3 +937,21 @@ server.listen(PORT, async () => {
     console.error(`[pool] warm failed: ${err.message}`)
   );
 });
+
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[shutdown] ${signal}`);
+  const stopped = new Promise((resolveClose) => server.close(resolveClose));
+  const forceTimer = setTimeout(() => {
+    server.closeAllConnections?.();
+  }, 10_000);
+  forceTimer.unref?.();
+  await stopped.catch(() => {});
+  clearTimeout(forceTimer);
+  await closeBrowserPool().catch(() => {});
+}
+
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
+process.once("SIGINT", () => void shutdown("SIGINT"));

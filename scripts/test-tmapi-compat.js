@@ -1,4 +1,11 @@
 const BASE = process.env.BASE || "http://localhost:3456";
+const API_TOKEN = process.env.API_TOKEN || "";
+const nativeFetch = globalThis.fetch;
+globalThis.fetch = (input, init) => {
+  const url = new URL(input);
+  if (API_TOKEN) url.searchParams.set("apiToken", API_TOKEN);
+  return nativeFetch(url, init);
+};
 
 const checks = [
   ["item_detail", "/1688/item_detail"],

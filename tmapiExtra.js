@@ -82,11 +82,18 @@ export function toTmapiSearchItem(item) {
 
 export function toTmapiSearch(raw, { keyword, page, page_size, sort = "default" }) {
   const items = (raw.results || []).map(toTmapiSearchItem);
+  const currentPage = Number(page) || 1;
+  const currentPageSize = Number(page_size) || items.length || 20;
+  const total = Number.isFinite(Number(raw.total))
+    ? Number(raw.total)
+    : items.length;
   return tmapiOk({
-    page: Number(page) || 1,
-    page_size: Number(page_size) || items.length || 20,
-    total_count:
-      raw.total != null ? String(raw.total) : String(items.length),
+    page: currentPage,
+    current_page: currentPage,
+    page_size: currentPageSize,
+    total,
+    total_count: String(total),
+    has_next_page: currentPage * currentPageSize < total,
     keyword: keyword || raw.keyword || "",
     sort,
     items,
@@ -94,10 +101,16 @@ export function toTmapiSearch(raw, { keyword, page, page_size, sort = "default" 
 }
 
 export function toTmapiShopItems(raw, meta) {
+  const currentPage = Number(meta.page) || 1;
+  const currentPageSize = Number(meta.page_size) || raw.items?.length || 20;
+  const total = Number(raw.total_count ?? raw.items?.length ?? 0);
   return tmapiOk({
-    page: Number(meta.page) || 1,
-    page_size: Number(meta.page_size) || raw.items?.length || 20,
-    total_count: raw.total_count ?? raw.items?.length ?? 0,
+    page: currentPage,
+    current_page: currentPage,
+    page_size: currentPageSize,
+    total,
+    total_count: total,
+    has_next_page: currentPage * currentPageSize < total,
     cat: meta.cat || "",
     keyword: meta.keyword || "",
     sort: meta.sort || "default",
@@ -124,16 +137,45 @@ export function convertImageUrl(imgUrl, { width, height } = {}) {
   const url = String(imgUrl || "").trim();
   if (!url) return tmapiError(422, "img_url is required");
 
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return tmapiError(422, "img_url must be an absolute http(s) URL");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    return tmapiError(422, "img_url must use http or https");
+  }
+  if (!/(?:^|\.)(?:alicdn\.com|1688\.com)$/i.test(parsed.hostname)) {
+    return tmapiError(
+      422,
+      "External image upload conversion is not available on this provider"
+    );
+  }
+
   // Strip existing size suffixes like _220x220.jpg / .jpg_sum.jpg
-  let out = url
+  parsed.pathname = parsed.pathname
     .replace(/_\d+x\d+\.(jpg|png|webp|jpeg)/i, ".$1")
     .replace(/\.(jpg|png|jpeg|webp)_.+$/i, ".$1");
 
-  const w = width ? Number(width) : null;
-  const h = height ? Number(height) : null;
-  if (w && h && /\.(jpg|jpeg|png|webp)$/i.test(out)) {
-    out = out.replace(/\.(jpg|jpeg|png|webp)$/i, `_${w}x${h}.$1`);
+  const w = width != null && width !== "" ? Number(width) : null;
+  const h = height != null && height !== "" ? Number(height) : null;
+  if (
+    (w != null && (!Number.isInteger(w) || w < 1 || w > 4096)) ||
+    (h != null && (!Number.isInteger(h) || h < 1 || h > 4096))
+  ) {
+    return tmapiError(422, "width and height must be integers from 1 to 4096");
   }
+  if ((w == null) !== (h == null)) {
+    return tmapiError(422, "width and height must be provided together");
+  }
+  if (w && h && /\.(jpg|jpeg|png|webp)$/i.test(parsed.pathname)) {
+    parsed.pathname = parsed.pathname.replace(
+      /\.(jpg|jpeg|png|webp)$/i,
+      `_${w}x${h}.$1`
+    );
+  }
+  const out = parsed.toString();
 
   return tmapiOk({
     original: url,

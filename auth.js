@@ -17,9 +17,16 @@ export async function hasSavedAuth() {
   }
 }
 
-function isLoggedInCookies(cookies) {
+export function isLoggedInCookies(cookies) {
+  const nowSeconds = Date.now() / 1000;
+  const usable = cookies.filter(
+    (cookie) =>
+      !Number.isFinite(Number(cookie.expires)) ||
+      Number(cookie.expires) <= 0 ||
+      Number(cookie.expires) > nowSeconds
+  );
   const byName = new Map(
-    cookies
+    usable
       .filter((c) => String(c.domain || "").includes("1688.com"))
       .map((c) => [c.name, c.value])
   );
@@ -28,10 +35,10 @@ function isLoggedInCookies(cookies) {
   if (byName.get("__cn_logon__") === "true") return true;
 
   // Fallback markers sometimes present after full SSO
-  const hasLid = cookies.some(
+  const hasLid = usable.some(
     (c) => c.name === "lid" && String(c.domain || "").includes("1688.com") && c.value
   );
-  const hasCookie2 = cookies.some(
+  const hasCookie2 = usable.some(
     (c) => c.name === "cookie2" && String(c.domain || "").includes("1688.com") && c.value
   );
   return hasLid && hasCookie2 && byName.get("__cn_logon__") !== "false";
@@ -44,7 +51,15 @@ async function verifySearchAccess(context) {
       "https://s.1688.com/selloffer/offer_search.htm?keywords=router&beginPage=1",
       { waitUntil: "domcontentloaded", timeout: 60_000 }
     );
-    await page.waitForTimeout(4000);
+    await page
+      .waitForFunction(
+        () =>
+          (window.data?.offerV2Showed?.offerList?.length || 0) > 0 ||
+          document.querySelectorAll('a[href*="detail.1688.com/offer"]').length > 0,
+        null,
+        { timeout: 8_000 }
+      )
+      .catch(() => {});
 
     return page.evaluate(() => {
       const href = location.href;
@@ -52,7 +67,7 @@ async function verifySearchAccess(context) {
       const listLen = window.data?.offerV2Showed?.offerList?.length || 0;
       const hasCards = document.querySelectorAll('a[href*="detail.1688.com/offer"]').length > 0;
       return {
-        ok: !login && (listLen > 0 || hasCards || /offer_search|selloffer/i.test(href)),
+        ok: !login && (listLen > 0 || hasCards),
         login,
         href,
         listLen,
@@ -75,8 +90,7 @@ export async function login1688({ timeoutMs = 10 * 60_000 } = {}) {
     const context = await browser.newContext({
       locale: "zh-CN",
       viewport: { width: 1280, height: 900 },
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      serviceWorkers: "block",
     });
     const page = await context.newPage();
 
@@ -93,10 +107,18 @@ export async function login1688({ timeoutMs = 10 * 60_000 } = {}) {
 
     // Also open homepage after a bit so SSO can settle if user already logged in elsewhere
     const waitEnter = rl.question("Press Enter after you are fully logged into 1688… ");
-    const timeout = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("Login timed out.")), timeoutMs)
-    );
-    await Promise.race([waitEnter, timeout]);
+    let timeoutHandle;
+    const timeout = new Promise((_, reject) => {
+      timeoutHandle = setTimeout(
+        () => reject(new Error("Login timed out.")),
+        timeoutMs
+      );
+    });
+    try {
+      await Promise.race([waitEnter, timeout]);
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
 
     // Warm session on main site
     await page.goto("https://www.1688.com/", {
@@ -136,6 +158,7 @@ export async function newAuthedContext(browser, options = {}) {
   const { blockAssets = true, ...contextOptions } = options;
   const base = {
     locale: "zh-CN",
+    serviceWorkers: "block",
     extraHTTPHeaders: { "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8" },
     ...contextOptions,
   };
@@ -144,28 +167,42 @@ export async function newAuthedContext(browser, options = {}) {
     ? await browser.newContext({ ...base, storageState: AUTH_PATH })
     : await browser.newContext(base);
 
-  if (blockAssets) {
-    await context.route("**/*", (route) => {
-      const request = route.request();
-      if (["image", "media", "font"].includes(request.resourceType())) return route.abort();
-      if (/google-analytics|googletagmanager|doubleclick|hm\.baidu|arms-retcode/i.test(request.url())) {
-        return route.abort();
-      }
-      return route.continue();
-    });
+  try {
+    if (blockAssets) {
+      await context.route("**/*", (route) => {
+        const request = route.request();
+        if (["image", "media", "font"].includes(request.resourceType())) {
+          return route.abort();
+        }
+        if (
+          /google-analytics|googletagmanager|doubleclick|hm\.baidu|arms-retcode/i.test(
+            request.url()
+          )
+        ) {
+          return route.abort();
+        }
+        return route.continue();
+      });
+    }
+    return context;
+  } catch (err) {
+    await context.close().catch(() => {});
+    throw err;
   }
-
-  return context;
 }
 
 export async function assertAuthLooksValid() {
   if (!(await hasSavedAuth())) return { ok: false, reason: "no auth file" };
-  const { readFileSync } = await import("node:fs");
-  const state = JSON.parse(readFileSync(AUTH_PATH, "utf8"));
-  const ok = isLoggedInCookies(state.cookies || []);
-  const logon = (state.cookies || []).find((c) => c.name === "__cn_logon__");
-  return {
-    ok,
-    reason: ok ? "ok" : `__cn_logon__=${logon?.value ?? "missing"}`,
-  };
+  try {
+    const { readFile } = await import("node:fs/promises");
+    const state = JSON.parse(await readFile(AUTH_PATH, "utf8"));
+    const ok = isLoggedInCookies(state.cookies || []);
+    const logon = (state.cookies || []).find((c) => c.name === "__cn_logon__");
+    return {
+      ok,
+      reason: ok ? "ok" : `__cn_logon__=${logon?.value ?? "missing or expired"}`,
+    };
+  } catch {
+    return { ok: false, reason: "auth file is unreadable" };
+  }
 }

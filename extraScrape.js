@@ -71,26 +71,29 @@ async function withLangCookies(context, lang) {
 }
 
 async function openOfferPage(browser, itemId, lang = "zh") {
-  const context = await newAuthedContext(browser, {
-    locale: lang === "en" ? "en-US" : "zh-CN",
-    viewport: { width: 1440, height: 900 },
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-  });
-  await withLangCookies(context, lang);
-  const page = await context.newPage();
-  await page.goto(`https://detail.1688.com/offer/${itemId}.html`, {
-    waitUntil: "domcontentloaded",
-    timeout: 60_000,
-  });
-  assertNotLoginPage(page, "item detail");
-  await page
-    .waitForFunction(() => Boolean(window.context?.result?.data), null, {
-      timeout: 45_000,
-    })
-    .catch(() => {});
-  await sleep(800);
-  return { context, page };
+  let context = null;
+  try {
+    context = await newAuthedContext(browser, {
+      locale: lang === "en" ? "en-US" : "zh-CN",
+      viewport: { width: 1440, height: 900 },
+    });
+    await withLangCookies(context, lang);
+    const page = await context.newPage();
+    await page.goto(`https://detail.1688.com/offer/${itemId}.html`, {
+      waitUntil: "domcontentloaded",
+      timeout: 40_000,
+    });
+    assertNotLoginPage(page, "item detail");
+    await page
+      .waitForFunction(() => Boolean(window.context?.result?.data), null, {
+        timeout: 12_000,
+      })
+      .catch(() => {});
+    return { context, page };
+  } catch (err) {
+    if (context) await context.close().catch(() => {});
+    throw err;
+  }
 }
 
 /** GET /1688/item_desc — description pictures */
@@ -156,6 +159,7 @@ export async function getItemDesc(itemId, { language = "zh" } = {}) {
         item_id: Number(id),
         detail_url: extracted.detailUrl,
         images: extracted.images,
+        detail_imgs: extracted.images,
       });
     } finally {
       await context.close();
@@ -238,7 +242,15 @@ export async function getItemReviews(
 }
 
 /** GET /1688/item_freight — shipping fee / delivery info from offer page */
-export async function getItemFreight(itemId, { language = "zh" } = {}) {
+export async function getItemFreight(
+  itemId,
+  {
+    language = "zh",
+    province = "",
+    total_quantity = 1,
+    total_weight = 0,
+  } = {}
+) {
   const id = String(itemId || "").trim();
   if (!/^\d+$/.test(id)) return tmapiError(422, "item_id must be a number");
   const lang = normalizeLang(language);
@@ -257,6 +269,28 @@ export async function getItemFreight(itemId, { language = "zh" } = {}) {
           body.match(/([\u4e00-\u9fff]{2,8}(?:省|市)[^\n]{0,12})\s*\n?\s*送至/) ||
           body.match(/发货地[：:\s]*([^\n]+)/);
 
+        const feeCandidates = [
+          freightInfo?.freightFee,
+          freightInfo?.fee,
+          freightInfo?.price,
+          shipping?.freightFee,
+        ];
+        let totalFee = null;
+        for (const candidate of feeCandidates) {
+          const numeric = Number(candidate);
+          if (Number.isFinite(numeric) && numeric >= 0) {
+            totalFee = numeric;
+            break;
+          }
+        }
+        if (totalFee == null && /包邮|免运费/.test(body)) totalFee = 0;
+        if (totalFee == null) {
+          const feeMatch = body.match(
+            /运费[^\d¥￥]{0,30}[¥￥]?\s*(\d+(?:\.\d+)?)/
+          );
+          if (feeMatch) totalFee = Number(feeMatch[1]);
+        }
+
         return {
           shipping,
           freight_text:
@@ -270,14 +304,38 @@ export async function getItemFreight(itemId, { language = "zh" } = {}) {
           unit_weight: shipping?.unitWeight ?? freightInfo?.unitWeight ?? null,
           delivery_limit: freightInfo?.deliveryLimit ?? null,
           logistics_text: freightInfo?.logisticsText || null,
+          total_fee: totalFee,
           protections: (shipping?.buyerProtectionModel || []).map(
             (p) => p.serviceName || p.packageBuyerDesc
           ),
         };
       });
 
+      const requestedProvince = String(province || "").trim();
+      if (
+        requestedProvince &&
+        (!info.ship_to || !String(info.ship_to).includes(requestedProvince))
+      ) {
+        return tmapiError(
+          502,
+          "1688 did not apply the requested shipping destination"
+        );
+      }
+      if (!Number.isFinite(Number(info.total_fee))) {
+        return tmapiError(502, "No numeric shipping fee was extracted from 1688");
+      }
+
+      const quantity = Math.max(1, Number(total_quantity) || 1);
+      const requestedWeight = Math.max(0, Number(total_weight) || 0);
+      const calculatedWeight =
+        requestedWeight || Math.max(0, Number(info.unit_weight) || 0) * quantity;
+
       return tmapiOk({
         item_id: Number(id),
+        total_fee: Number(info.total_fee),
+        shipping_to: requestedProvince || info.ship_to,
+        total_quantity: quantity,
+        total_weight: calculatedWeight,
         freight_text: info.freight_text,
         logistics_text: info.logistics_text,
         location_from: info.location_from,
@@ -312,23 +370,75 @@ function extractMemberId(shop_url, member_id) {
   return m ? decodeURIComponent(m[1]) : "";
 }
 
-function shopOfferListUrl(shopUrl, memberId, pageNo) {
-  if (memberId) {
-    return `https://winport.m.1688.com/page/offerlist.html?memberId=${encodeURIComponent(memberId)}&pageNum=${pageNo}`;
+function normalizeSort(sort) {
+  const value = String(sort || "default")
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, "_");
+  if (["sales", "sales_desc", "booked"].includes(value)) return "sales";
+  if (["price_up", "priceup", "price_asc"].includes(value)) return "price_up";
+  if (["price_down", "pricedown", "price_desc"].includes(value)) {
+    return "price_down";
   }
+  if (["new", "newest", "new_offer"].includes(value)) return "newest";
+  return "default";
+}
 
-  const raw = String(shopUrl || "").trim();
-  if (!raw) return "";
-  try {
-    const parsed = new URL(raw);
-    const hostname = parsed.hostname.toLowerCase();
-    if (parsed.protocol !== "https:" || !(hostname === "1688.com" || hostname.endsWith(".1688.com"))) {
+function applySearchSort(params, sort) {
+  const normalized = normalizeSort(sort);
+  const sortType = {
+    sales: "booked",
+    price_up: "price-asc",
+    price_down: "price-desc",
+    newest: "newOffer",
+  }[normalized];
+  if (sortType) params.set("sortType", sortType);
+}
+
+function applyShopSort(params, sort) {
+  const normalized = normalizeSort(sort);
+  const sortType = {
+    sales: "volume_desc",
+    price_up: "price_asc",
+    price_down: "price_desc",
+    newest: "create_desc",
+  }[normalized];
+  if (sortType) params.set("sortType", sortType);
+}
+
+function shopOfferListUrl(
+  shopUrl,
+  memberId,
+  pageNo,
+  { pageSize, categoryId, sort } = {}
+) {
+  let target;
+  if (memberId) {
+    target = new URL("https://winport.m.1688.com/page/offerlist.html");
+    target.searchParams.set("memberId", memberId);
+  } else {
+    const raw = String(shopUrl || "").trim();
+    if (!raw) return "";
+    try {
+      const parsed = new URL(raw);
+      const hostname = parsed.hostname.toLowerCase();
+      if (
+        parsed.protocol !== "https:" ||
+        !(hostname === "1688.com" || hostname.endsWith(".1688.com"))
+      ) {
+        return "";
+      }
+      target = new URL("/page/offerlist.html", parsed.origin);
+    } catch {
       return "";
     }
-    return `${parsed.origin}/page/offerlist.html?pageNum=${pageNo}`;
-  } catch {
-    return "";
   }
+
+  target.searchParams.set("pageNum", String(pageNo));
+  if (pageSize) target.searchParams.set("pageSize", String(pageSize));
+  if (categoryId) target.searchParams.set("categoryId", String(categoryId));
+  applyShopSort(target.searchParams, sort);
+  return target.toString();
 }
 
 function collectOfferIdsFromText(text, set) {
@@ -360,6 +470,9 @@ export async function getShopItems({
   sort = "default",
   keyword = "",
   shop_cat_id = "",
+  cat_id = "",
+  price_start = "",
+  price_end = "",
   language = "zh",
 } = {}) {
   let mid = extractMemberId(shop_url, member_id);
@@ -367,14 +480,21 @@ export async function getShopItems({
   const lang = normalizeLang(language);
   const pageNo = Math.max(1, Number(page) || 1);
   const size = Math.min(50, Math.max(1, Number(page_size) || 20));
-  let offerListUrl = shopOfferListUrl(shop_url, mid, pageNo);
+  const selectedCategoryId = String(shop_cat_id || cat_id || "").trim();
+  const listOptions = {
+    pageSize: size,
+    categoryId: selectedCategoryId,
+    sort,
+  };
+  let offerListUrl = shopOfferListUrl(shop_url, mid, pageNo, listOptions);
   if (!offerListUrl) {
     return tmapiError(422, "member_id or a valid 1688 shop_url is required");
   }
   const browser = await acquirePooledBrowser();
+  let context = null;
 
   try {
-    const context = await newAuthedContext(browser, {
+    context = await newAuthedContext(browser, {
       isMobile: true,
       hasTouch: true,
       locale: lang === "en" ? "en-US" : "zh-CN",
@@ -410,7 +530,7 @@ export async function getShopItems({
           p.url().match(/[?&]memberId=(b2b-[^&]+)/i);
         if (match?.[1]) {
           mid = decodeURIComponent(match[1]);
-          offerListUrl = shopOfferListUrl("", mid, pageNo);
+          offerListUrl = shopOfferListUrl("", mid, pageNo, listOptions);
         }
       }
       await p.goto(offerListUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
@@ -498,11 +618,41 @@ export async function getShopItems({
           `${it.title}`.toLowerCase().includes(String(keyword).toLowerCase())
         );
       }
-      void shop_cat_id;
-      void sort;
+      const minPrice = price_start !== "" ? Number(price_start) : null;
+      const maxPrice = price_end !== "" ? Number(price_end) : null;
+      const numericPrice = (item) => {
+        const match = String(item.price ?? "").match(/\d+(?:\.\d+)?/);
+        return match ? Number(match[0]) : null;
+      };
+      if (Number.isFinite(minPrice)) {
+        items = items.filter((item) => {
+          const price = numericPrice(item);
+          return price != null && price >= minPrice;
+        });
+      }
+      if (Number.isFinite(maxPrice)) {
+        items = items.filter((item) => {
+          const price = numericPrice(item);
+          return price != null && price <= maxPrice;
+        });
+      }
+      const normalizedSort = normalizeSort(sort);
+      if (normalizedSort === "price_up" || normalizedSort === "price_down") {
+        const direction = normalizedSort === "price_up" ? 1 : -1;
+        items.sort(
+          (left, right) =>
+            direction * ((numericPrice(left) ?? Infinity) - (numericPrice(right) ?? Infinity))
+        );
+      } else if (normalizedSort === "sales") {
+        items.sort(
+          (left, right) =>
+            Number(right.sale_quantity || 0) - Number(left.sale_quantity || 0)
+        );
+      }
 
-      const start = (pageNo - 1) * size;
-      const pageItems = items.slice(start, start + size);
+      // The upstream URL already selects pageNo. Only cap that page to page_size;
+      // applying the page offset again made every page after page 1 go empty.
+      const pageItems = items.slice(0, size);
 
       if (!pageItems.length) {
         return tmapiError(502, "No shop products were extracted from 1688");
@@ -522,16 +672,16 @@ export async function getShopItems({
           page_size: size,
           sort,
           keyword,
-          cat: shop_cat_id || "",
+          cat: selectedCategoryId,
         }
       );
     } finally {
       p.off("response", onResp);
-      await context.close();
     }
   } catch (err) {
     return tmapiError(500, err.message || "shop items failed");
   } finally {
+    if (context) await context.close().catch(() => {});
     releaseBrowser(browser);
   }
 }
@@ -994,20 +1144,10 @@ export async function getCategoryProducts({
     return searchItemsTmapi({ keyword, page, page_size, sort, language });
   }
 
-  const known = knownCategory(cat);
-  if (known) {
-    return searchItemsTmapi({
-      keyword: known.name_en,
-      page,
-      page_size,
-      sort,
-      language,
-    });
-  }
-
   const browser = await acquirePooledBrowser();
+  let context = null;
   try {
-    const context = await newAuthedContext(browser, {
+    context = await newAuthedContext(browser, {
       locale: lang === "en" ? "en-US" : "zh-CN",
       viewport: { width: 1440, height: 900 },
     });
@@ -1015,10 +1155,17 @@ export async function getCategoryProducts({
     const page = await context.newPage();
     try {
       const kw = keyword && keyword !== "*" ? keyword : "*";
-      const url =
-        `https://s.1688.com/selloffer/offer_search.htm?keywords=${encodeURIComponent(kw)}` +
-        `&filt=y&n=y&categoryId=${encodeURIComponent(cat)}&beginPage=${pageNo}`;
+      const params = new URLSearchParams({
+        keywords: kw,
+        filt: "y",
+        n: "y",
+        categoryId: cat,
+        beginPage: String(pageNo),
+      });
+      applySearchSort(params, sort);
+      const url = `https://s.1688.com/selloffer/offer_search.htm?${params}`;
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      assertNotLoginPage(page, "category products");
       await sleep(4500);
 
       let items = await page.evaluate(() => {
@@ -1047,6 +1194,16 @@ export async function getCategoryProducts({
             ) || null
         )) || items.length;
 
+      if (!items.length) {
+        return tmapiError(502, "No category products were extracted from 1688");
+      }
+
+      const categoryName = knownCategory(cat)?.name || "";
+      items = items.map((item) => ({
+        ...item,
+        category_path: [{ id: cat, cat_id: cat, name: categoryName }],
+      }));
+
       if (lang === "en" && items.length) {
         const titles = await translateTexts(items.map((i) => i.title));
         items = items.map((it, i) => ({ ...it, title: titles[i] || it.title }));
@@ -1062,11 +1219,12 @@ export async function getCategoryProducts({
         }
       );
     } finally {
-      await context.close();
+      await page.close().catch(() => {});
     }
   } catch (err) {
     return tmapiError(500, err.message || "category products failed");
   } finally {
+    if (context) await context.close().catch(() => {});
     releaseBrowser(browser);
   }
 }

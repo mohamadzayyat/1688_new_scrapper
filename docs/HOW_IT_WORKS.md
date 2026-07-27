@@ -254,7 +254,8 @@ The UI summary card **Took** shows `durationSeconds`. CLI/server also log `[timi
 ## Quick start
 
 ```bash
-npm install
+npm ci
+npm run install:browsers
 npm start
 # open http://localhost:3456
 ```

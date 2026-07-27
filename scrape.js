@@ -12,6 +12,11 @@ import {
 } from "./offerContext.js";
 import { translateItemDetailData } from "./translate.js";
 
+const ITEM_SCRAPE_TIMEOUT_MS = Math.max(
+  10_000,
+  Number(process.env.ITEM_SCRAPE_TIMEOUT_MS) || 34_000
+);
+
 function usage(exitCode = 1) {
   console.error(`Usage:
   node scrape.js <offerId> [--out path.json] [--headed]
@@ -335,6 +340,7 @@ export async function getItemDetailById(
   { headed = false, language = "zh", optimize_title = false } = {}
 ) {
   const startedAt = Date.now();
+  const deadline = startedAt + ITEM_SCRAPE_TIMEOUT_MS;
   const lang = normalizeLang(language);
   const offerId = String(itemId || "").trim();
   if (!/^\d+$/.test(offerId)) {
@@ -349,8 +355,6 @@ export async function getItemDetailById(
   const buildContextOpts = () => ({
     locale: "zh-CN",
     viewport: { width: 1280, height: 800 },
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     extraHTTPHeaders: {
       "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     },
@@ -360,6 +364,7 @@ export async function getItemDetailById(
     let lastError;
 
     for (let attempt = 1; attempt <= 2; attempt++) {
+      if (Date.now() >= deadline) break;
       const contextOpts = buildContextOpts();
       if (!headed && (await hasSavedAuth())) {
         contextOpts.storageState = AUTH_PATH;
@@ -388,6 +393,7 @@ export async function getItemDetailById(
       try {
         const raw = await scrapeOfferFast(page, offerId, url, {
           allowHydrate: !documentOnly,
+          deadline,
         });
         if (!isUsableRawOffer(raw)) {
           throw new Error("Could not find product data on the page");
@@ -428,7 +434,12 @@ export async function getItemDetailById(
 /**
  * Prefer HTML-embedded context (fast). Optionally wait for window.context hydrate.
  */
-async function scrapeOfferFast(page, offerId, url, { allowHydrate = false } = {}) {
+async function scrapeOfferFast(
+  page,
+  offerId,
+  url,
+  { allowHydrate = false, deadline = Infinity } = {}
+) {
   /** @type {any} */
   let fromHtml = null;
   let htmlBytes = 0;
@@ -451,13 +462,18 @@ async function scrapeOfferFast(page, offerId, url, { allowHydrate = false } = {}
 
   page.on("response", onResponse);
   try {
+    const remaining = deadline - Date.now();
+    if (remaining < 1_000) throw new Error("Item scrape deadline exceeded");
     await page.goto(url, {
       waitUntil: allowHydrate ? "domcontentloaded" : "commit",
-      timeout: 45_000,
+      timeout: Math.min(allowHydrate ? 18_000 : 12_000, remaining),
     });
 
-    const deadline = Date.now() + (allowHydrate ? 12_000 : 8_000);
-    while (!fromHtml && Date.now() < deadline) {
+    const dataDeadline = Math.min(
+      deadline,
+      Date.now() + (allowHydrate ? 8_000 : 5_000)
+    );
+    while (!fromHtml && Date.now() < dataDeadline) {
       await sleep(30);
       if (allowHydrate && !fromHtml) {
         const ready = await page
@@ -474,7 +490,11 @@ async function scrapeOfferFast(page, offerId, url, { allowHydrate = false } = {}
     if (fromHtml) return fromHtml;
 
     if (allowHydrate) {
-      await waitForOfferData(page, 15_000);
+      const hydrateRemaining = deadline - Date.now();
+      if (hydrateRemaining < 1_000) {
+        throw new Error("Item scrape deadline exceeded");
+      }
+      await waitForOfferData(page, Math.min(8_000, hydrateRemaining));
       const raw = await extractRawOffer(page, offerId);
       if (isUsableRawOffer(raw)) return raw;
     }

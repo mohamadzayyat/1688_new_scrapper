@@ -7,8 +7,13 @@ For a deep dive on architecture, speed tactics, proxy/auth/language, see **[docs
 ## Setup
 
 ```bash
-npm install
+npm ci
+npm run install:browsers
 ```
+
+Copy `.env.example` into your process manager or deployment environment. In
+production, set `SCRAPER_API_TOKEN`, keep `HOST=127.0.0.1` behind the TLS reverse
+proxy, and keep `MAX_CONCURRENT` equal to `BROWSER_POOL_SIZE`.
 
 ## Local UI
 
@@ -94,6 +99,28 @@ npm run login
 4. It verifies search works, then saves `.auth/1688.json`
 
 If `__cn_logon__` is still `false`, login was incomplete — run `npm run login` again.
+
+## Remote login
+
+For a remote/headless server, run `npm run login:headless`, securely retrieve
+the screenshot path printed by the command, scan its QR code, and wait for
+`.auth/1688.json` to be saved. Treat both the screenshot and auth file as
+secrets; neither is committed.
+
+## Verification
+
+```bash
+npm run test:core
+npm run test:pool
+BASE=https://your-host API_TOKEN=your-token npm run test:compat
+BASE=https://your-host API_TOKEN=your-token npm run test:release
+```
+
+`test:release` calls the exact Chibox aliases and fails on responses that are
+HTTP-successful but unusable by Chibox. It also checks pagination overlap and
+warm-cache latency. Keep the old provider fallback enabled until this gate
+passes against representative products, shops, categories, shipping inputs,
+and external images.
 
 ## Notes
 

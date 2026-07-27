@@ -1,4 +1,11 @@
 const BASE = process.env.BASE || "http://localhost:3456";
+const API_TOKEN = process.env.API_TOKEN || "";
+const nativeFetch = globalThis.fetch;
+globalThis.fetch = (input, init) => {
+  const url = new URL(input);
+  if (API_TOKEN) url.searchParams.set("apiToken", API_TOKEN);
+  return nativeFetch(url, init);
+};
 const ITEM = "874039857500";
 const URL = `https://detail.1688.com/offer/${ITEM}.html`;
 const MEMBER = "b2b-221822542203833240";

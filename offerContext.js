@@ -2,6 +2,12 @@
  * Parse 1688 offer `window.context` from raw HTML (IIFE form).
  * Avoids waiting for page JS / translators.
  */
+import JSON5 from "json5";
+
+const MAX_CONTEXT_BYTES = Math.max(
+  1_000_000,
+  Number(process.env.MAX_CONTEXT_BYTES) || 12_000_000
+);
 
 /**
  * Extract a JS object literal starting at `startIdx` (first non-space should be `{`).
@@ -41,8 +47,12 @@ export function extractJsObject(html, startIdx) {
       depth--;
       if (depth === 0) {
         const raw = html.slice(i, j + 1);
+        if (raw.length > MAX_CONTEXT_BYTES) return null;
         try {
-          return Function(`"use strict"; return (${raw})`)();
+          // 1688 currently emits a JavaScript object literal rather than strict
+          // JSON. JSON5 accepts its quoted/unquoted keys and trailing commas
+          // without executing page-controlled source in the Node process.
+          return JSON5.parse(raw);
         } catch {
           return null;
         }
@@ -127,5 +137,11 @@ export function contextToRawOffer(offerId, ctx) {
 }
 
 export function isUsableRawOffer(raw) {
-  return Boolean(raw && (raw.title || raw.skuModel || raw.mainPrice));
+  const images = raw?.images || raw?.galleryImgs || [];
+  return Boolean(
+    raw?.title &&
+      (raw.mainPrice || raw.skuModel) &&
+      Array.isArray(images) &&
+      images.length > 0
+  );
 }

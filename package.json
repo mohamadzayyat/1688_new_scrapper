@@ -12,13 +12,18 @@
     "scrape": "node cli.js",
     "search": "node cli.js --search",
     "login": "node cli.js --login",
+    "login:headless": "node scripts/login-headless.js",
     "test:compat": "node scripts/test-tmapi-compat.js",
-    "postinstall": "npx playwright install --with-deps chromium"
+    "test:core": "node scripts/test-core.js",
+    "test:pool": "node scripts/test-browser-pool.js",
+    "test:release": "node scripts/test-release-gate.js",
+    "install:browsers": "playwright install --with-deps chromium"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "dependencies": {
-    "playwright": "^1.54.1"
+    "json5": "2.2.3",
+    "playwright": "1.61.1"
   }
 }

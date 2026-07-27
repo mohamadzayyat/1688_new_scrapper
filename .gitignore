@@ -10,3 +10,6 @@ proxy.config.json
 .DS_Store
 playwright-report/
 test-results/
+.env
+.env.*
+!.env.example

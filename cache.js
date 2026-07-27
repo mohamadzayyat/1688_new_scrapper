@@ -2,7 +2,7 @@
  * In-process + optional disk TTL cache.
  * Supports stale-while-revalidate so hot paths stay under 1s.
  */
-import { mkdir, readFile, writeFile, unlink } from "node:fs/promises";
+import { mkdir, readFile, writeFile, unlink, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
@@ -17,7 +17,7 @@ const DISK_DIR =
   process.env.CACHE_DIR ||
   join(fileURLToPath(new URL(".", import.meta.url)), ".cache");
 const DISK_ENABLED = String(process.env.DISK_CACHE || "1") !== "0";
-const CACHE_VERSION = process.env.CACHE_VERSION || "v2";
+const CACHE_VERSION = process.env.CACHE_VERSION || "v3";
 
 const store = new Map(); // key -> { expires, staleUntil, value }
 const inflight = new Map(); // key -> Promise (singleflight)
@@ -25,6 +25,7 @@ let hits = 0;
 let misses = 0;
 let staleHits = 0;
 let diskHits = 0;
+let refreshFailures = 0;
 
 function now() {
   return Date.now();
@@ -45,9 +46,9 @@ function diskPath(key) {
 }
 
 export function cacheKey(parts) {
-  return [CACHE_VERSION, ...parts]
-    .map((p) => String(p ?? "").trim().toLowerCase())
-    .join("|");
+  // Values such as signed image URLs can be case-sensitive. Callers should
+  // canonicalize genuinely case-insensitive arguments before building a key.
+  return [CACHE_VERSION, ...parts].map((p) => String(p ?? "").trim()).join("|");
 }
 
 function isCacheableValue(value) {
@@ -55,7 +56,17 @@ function isCacheableValue(value) {
   if (!value.data || typeof value.data !== "object" || Array.isArray(value.data)) {
     return true;
   }
-  const collectionKeys = ["items", "list", "categories", "reviews", "ratings"];
+  const collectionKeys = [
+    "items",
+    "list",
+    "categories",
+    "children",
+    "reviews",
+    "ratings",
+    "images",
+    "detail_imgs",
+    "main_imgs",
+  ];
   const present = collectionKeys.filter((key) => Array.isArray(value.data[key]));
   return present.length === 0 || present.some((key) => value.data[key].length > 0);
 }
@@ -105,44 +116,71 @@ export function cacheSet(key, value, ttlMs = DEFAULT_TTL_MS) {
   });
   evictIfNeeded();
   if (DISK_ENABLED) {
-    void persistDisk(key, value, keepStaleFor);
+    void persistDisk(key, value, freshFor, keepStaleFor);
   }
 }
 
-async function persistDisk(key, value, ttlMs) {
+async function persistDisk(key, value, freshFor, keepStaleFor) {
   try {
     await mkdir(DISK_DIR, { recursive: true });
+    const writtenAt = now();
     const payload = {
       key,
-      expires: now() + ttlMs,
+      freshUntil: writtenAt + freshFor,
+      staleUntil: writtenAt + keepStaleFor,
       value,
     };
-    await writeFile(diskPath(key), JSON.stringify(payload), "utf8");
+    const target = diskPath(key);
+    const temporary = `${target}.${process.pid}.${writtenAt}.tmp`;
+    await writeFile(temporary, JSON.stringify(payload), "utf8");
+    await rename(temporary, target);
   } catch {
     // disk cache is best-effort
   }
 }
 
-async function readDisk(key) {
+async function readDisk(key, { allowStale = false } = {}) {
   if (!DISK_ENABLED) return null;
   try {
     const raw = await readFile(diskPath(key), "utf8");
     const payload = JSON.parse(raw);
-    if (!payload || payload.expires <= now()) {
+    // Legacy entries only had one stale expiry. Never treat those as fresh.
+    const freshUntil = Number(payload?.freshUntil || 0);
+    const staleUntil = Number(payload?.staleUntil || payload?.expires || 0);
+    const t = now();
+    if (!payload || staleUntil <= t) {
       void unlink(diskPath(key)).catch(() => {});
       return null;
     }
+    const fresh = freshUntil > t;
+    if (!fresh && !allowStale) return null;
     diskHits += 1;
-    // hydrate memory as stale-capable
     store.set(key, {
       value: payload.value,
-      expires: Math.min(payload.expires, now() + DEFAULT_TTL_MS),
-      staleUntil: payload.expires,
+      expires: freshUntil,
+      staleUntil,
     });
-    return payload.value;
+    return { value: payload.value, fresh };
   } catch {
     return null;
   }
+}
+
+function refreshInBackground(key, ttlMs, producer) {
+  if (inflight.has(key)) return;
+  const refresh = Promise.resolve()
+    .then(producer)
+    .then((value) => {
+      if (isCacheableValue(value)) cacheSet(key, value, ttlMs);
+      return value;
+    })
+    .catch((err) => {
+      refreshFailures += 1;
+      console.error(`[cache] background refresh failed: ${err?.message || err}`);
+      return null;
+    })
+    .finally(() => inflight.delete(key));
+  inflight.set(key, refresh);
 }
 
 /**
@@ -156,11 +194,10 @@ export async function cached(key, ttlMs, producer) {
 
   const job = (async () => {
     const disk = await readDisk(key);
-    if (disk != null) {
+    if (disk?.fresh) {
       hits += 1;
-      return disk;
+      return disk.value;
     }
-    misses += 1;
     const value = await producer();
     if (isCacheableValue(value)) {
       cacheSet(key, value, ttlMs);
@@ -184,32 +221,20 @@ export async function cachedSwr(key, ttlMs, producer) {
 
   if (mem && !mem.fresh) {
     // serve stale, refresh off-request
-    if (!inflight.has(key)) {
-      const refresh = (async () => {
-        const value = await producer();
-        if (isCacheableValue(value)) cacheSet(key, value, ttlMs);
-        return value;
-      })().finally(() => inflight.delete(key));
-      inflight.set(key, refresh);
-    }
+    refreshInBackground(key, ttlMs, producer);
     return mem.value;
   }
 
   // try disk before cold scrape
-  const disk = await readDisk(key);
-  if (disk != null) {
-    if (!inflight.has(key)) {
-      const refresh = (async () => {
-        const value = await producer();
-        if (isCacheableValue(value)) cacheSet(key, value, ttlMs);
-        return value;
-      })().finally(() => inflight.delete(key));
-      inflight.set(key, refresh);
-    }
-    return disk;
+  const disk = await readDisk(key, { allowStale: true });
+  if (disk) {
+    hits += 1;
+    if (!disk.fresh) refreshInBackground(key, ttlMs, producer);
+    return disk.value;
   }
 
   if (inflight.has(key)) return inflight.get(key);
+  misses += 1;
 
   const job = (async () => {
     const value = await producer();
@@ -228,6 +253,7 @@ export function cacheStats() {
     misses,
     staleHits,
     diskHits,
+    refreshFailures,
     hitRate:
       hits + misses === 0 ? 0 : Number((hits / (hits + misses)).toFixed(3)),
     ttlMs: DEFAULT_TTL_MS,

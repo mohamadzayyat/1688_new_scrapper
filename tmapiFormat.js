@@ -173,7 +173,7 @@ function buildSkus(skuInfoMap, skuPropsFormatted) {
       if (hit) {
         idParts.push(`${hit.pid}:${hit.vid}`);
       }
-      nameParts.push(name);
+      nameParts.push(propName ? `${propName}:${name}` : name);
     });
 
     const price = sku.discountPrice || sku.price || "0";
@@ -286,6 +286,70 @@ export function toTmapiItemDetail(raw) {
         ? String(temp.saledCount)
         : "0";
 
+  const priceRange = buildPriceRange(raw);
+  const skuPrices = skus
+    .map((sku) => Number(sku.sale_price))
+    .filter((price) => Number.isFinite(price) && price > 0);
+  const tierPrices = (priceRange.sku_param || [])
+    .map((tier) => ({
+      begin_num: String(tier.beginAmount || "1"),
+      price: Number(tier.price),
+    }))
+    .filter((tier) => Number.isFinite(tier.price) && tier.price > 0);
+  const minPrice =
+    Number(min) > 0
+      ? Number(min)
+      : skuPrices.length
+        ? Math.min(...skuPrices)
+        : tierPrices.length
+          ? Math.min(...tierPrices.map((tier) => tier.price))
+          : null;
+  const maxPrice =
+    Number(max) > 0
+      ? Number(max)
+      : skuPrices.length
+        ? Math.max(...skuPrices)
+        : tierPrices.length
+          ? Math.max(...tierPrices.map((tier) => tier.price))
+          : minPrice;
+  const skuStock = skus.reduce(
+    (total, sku) =>
+      total + (Number.isFinite(Number(sku.stock)) ? Number(sku.stock) : 0),
+    0
+  );
+  const rawStock =
+    raw.orderParam?.canBookedAmount ??
+    raw.mainPrice?.finalPriceModel?.tradeWithoutPromotion?.canBookedAmountOriginal ??
+    null;
+  const totalStock =
+    rawStock != null && Number.isFinite(Number(rawStock))
+      ? Number(rawStock)
+      : skus.length
+        ? skuStock
+        : null;
+  const quantityBegin = Math.max(1, Number(priceRange.begin_num) || 1);
+  const freight = raw.shipping?.freightInfo || {};
+  const inferredDelivery = {
+    location:
+      freight.location ||
+      freight.locationName ||
+      freight.sendGoodsAddressText ||
+      null,
+    delivery_fee: freight.freightFee ?? freight.price ?? null,
+    unit_weight: raw.shipping?.unitWeight ?? freight.unitWeight ?? null,
+    template_id: freight.freightTemplateId ?? freight.templateId ?? null,
+  };
+  const hasDeliverySignal = Object.values(inferredDelivery).some(
+    (value) => value !== null && value !== ""
+  );
+  const serviceTags = (raw.mainServices?.guaranteeList || [])
+    .map((service) => ({
+      code: service.serviceCode || "",
+      name: service.serviceName || "",
+      description: service.description || "",
+    }))
+    .filter((service) => service.code || service.name);
+
   const data = {
     item_id: Number(temp.offerId || raw.offerId),
     title,
@@ -294,6 +358,21 @@ export function toTmapiItemDetail(raw) {
     ),
     root_category_id: String(temp.topCategoryId ?? ""),
     currency: "CNY",
+    product_url: `https://detail.1688.com/offer/${temp.offerId || raw.offerId}.html`,
+    price: minPrice != null ? String(minPrice) : null,
+    price_info: {
+      price: minPrice != null ? String(minPrice) : null,
+      price_min: minPrice != null ? String(minPrice) : null,
+      price_max: maxPrice != null ? String(maxPrice) : null,
+      sale_price: minPrice != null ? String(minPrice) : null,
+      origin_price: maxPrice != null ? String(maxPrice) : null,
+      currency: "CNY",
+    },
+    quantity_begin: quantityBegin,
+    moq: quantityBegin,
+    stock: totalStock,
+    total_stock: totalStock,
+    is_sold_out: totalStock != null ? totalStock === 0 : false,
     offer_unit: temp.offerUnit || raw.mainPrice?.unit || "个",
     product_props: buildProductProps(raw),
     main_imgs: mainImgs,
@@ -313,14 +392,25 @@ export function toTmapiItemDetail(raw) {
       seller_user_id: String(sellerUserId || ""),
       seller_member_id: String(memberId || ""),
     },
-    delivery_info: raw.deliveryInfo ?? null,
+    sale_info: {
+      sale_quantity: saleCount,
+      amount_on_sale: totalStock,
+    },
+    delivery_info:
+      raw.deliveryInfo ?? (hasDeliverySignal ? inferredDelivery : null),
+    service_tags: serviceTags,
     sku_price_scale: scale ? (String(scale).startsWith("￥") ? scale : `￥${String(scale).replace(/-/g, "-￥")}`) : "",
     sku_price_scale_original: scaleOriginal
       ? String(scaleOriginal).startsWith("￥")
         ? scaleOriginal
         : `￥${String(scaleOriginal).replace(/-/g, "-￥")}`
       : "",
-    sku_price_range: buildPriceRange(raw),
+    sku_price_range: priceRange,
+    tiered_price_info: {
+      begin_num: String(quantityBegin),
+      prices: tierPrices,
+    },
+    mixed_batch: priceRange.mix_param,
     sku_props: skuProps,
     skus,
   };
