@@ -82,7 +82,7 @@ const REQUIRE_COLD_CACHE_MISS = boolEnv("REQUIRE_COLD_CACHE_MISS", true);
 const FIXTURE = {
   itemId: String(ENV.ITEM_ID || "874039857500").trim(),
   reviewItemId: String(ENV.REVIEW_ITEM_ID || ENV.ITEM_ID || "874039857500").trim(),
-  categoryId: String(ENV.CATEGORY_ID || "122234002").trim(),
+  categoryId: String(ENV.CATEGORY_ID || "130823000").trim(),
   memberId: String(ENV.MEMBER_ID || "b2b-221822542203833240").trim(),
   keyword: String(ENV.KEYWORD || "armrest pad").trim(),
   imageUrl: String(ENV.IMAGE_URL || "https://placehold.co/600x600.jpg").trim(),

@@ -3,7 +3,7 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 
 const ITEM_ID = "874039857500";
-const CATEGORY_ID = "122234002";
+const CATEGORY_ID = "130823000";
 const MEMBER_ID = "b2b-221822542203833240";
 const ALIBABA_IMAGE = "https://cbu01.alicdn.com/img/ibank/O1CN01.jpg";
 
@@ -146,13 +146,15 @@ function responseData(key, url, options) {
     options.legacyOld && key === "text_search"
       ? Math.max(1, Math.min(pageSize, total) - 1)
       : Math.min(pageSize, total);
-  return {
+  const paged = {
     items: Array.from({ length: count }, (_, index) => card(index + 1)),
     page,
     page_size: pageSize,
     total_count: total,
     has_next_page: page * pageSize < total,
   };
+  if (options.legacyOld && key === "category_items") delete paged.total_count;
+  return paged;
 }
 
 function sendJson(response, status, body) {

@@ -265,7 +265,7 @@ const SHOP_PAGE_SIZE = integerEnv("AB_SHOP_PAGE_SIZE", 20, 1, 50);
 const IMAGE_PAGE_SIZE = integerEnv("AB_IMAGE_PAGE_SIZE", 20, 1, 50);
 const FIXTURE = {
   itemId: String(ENV.ITEM_ID || "874039857500").trim(),
-  categoryId: String(ENV.CATEGORY_ID || "122234002").trim(),
+  categoryId: String(ENV.CATEGORY_ID || "130823000").trim(),
   memberId: String(ENV.MEMBER_ID || "b2b-221822542203833240").trim(),
   keyword: String(ENV.KEYWORD || "armrest pad").trim(),
   language: String(ENV.LANGUAGE || "en").trim(),
@@ -414,7 +414,9 @@ function inspectPagedCards(expectedPageSize) {
     if (page !== 1) issues.push("page is not 1");
     if (pageSize !== expectedPageSize) issues.push("page_size differs from request");
     const total = finiteNumber(data.total_count ?? data.total);
-    if (total === null || total < 0) issues.push("total is missing or invalid");
+    if ((total === null || total < 0) && provider?.key === "new") {
+      issues.push("total is missing or invalid");
+    }
     if (typeof data.has_next_page !== "boolean") issues.push("has_next_page is not boolean");
 
     const safeRows = rows || [];
@@ -965,7 +967,10 @@ function compareProfiles(oldResult, newResult) {
       (oldProfile.page === newProfile.page &&
         oldProfile.pageSize === newProfile.pageSize &&
         oldProfile.hasNext === newProfile.hasNext &&
-        relativeDifference(oldProfile.total, newProfile.total) <= LIST_TOTAL_TOLERANCE);
+        (oldProfile.total === null || oldProfile.total === undefined
+          ? Number.isFinite(newProfile.total)
+          : relativeDifference(oldProfile.total, newProfile.total) <=
+            LIST_TOTAL_TOLERANCE));
     return {
       comparable: true,
       ok: metadataMatches && countRatio >= 0.8 && overlap >= MIN_LIST_OVERLAP,
