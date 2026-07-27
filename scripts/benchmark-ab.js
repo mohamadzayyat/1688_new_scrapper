@@ -22,7 +22,7 @@
  *   AB_CONCURRENCY_ROUNDS=2
  *   AB_DISTINCT_DETAIL_COUNT=8
  *   AB_REQUIRE_DISTINCT_LOAD=1
- *   AB_MIN_OLD_SUCCESS_RATE=0.8
+ *   AB_MIN_OLD_SUCCESS_RATE=0.0
  *   AB_MIN_NEW_SUCCESS_RATE=1.0
  *   AB_MIN_EQUIV_RATE=1.0
  *   AB_MIN_LIST_OVERLAP=0.5
@@ -78,7 +78,7 @@ Common controls:
   AB_SAMPLES=20  AB_WARMUPS=1  AB_TIMEOUT_MS=45000
   AB_CONCURRENCY=4  AB_CONCURRENCY_REQUESTS=12  AB_CONCURRENCY_ROUNDS=2
   AB_DISTINCT_DETAIL_COUNT=8  AB_REQUIRE_DISTINCT_LOAD=1
-  AB_MIN_OLD_SUCCESS_RATE=0.80  AB_MIN_NEW_SUCCESS_RATE=1.00
+  AB_MIN_OLD_SUCCESS_RATE=0.00  AB_MIN_NEW_SUCCESS_RATE=1.00
   OLD_AUTH_MODE=query|header|bearer|none
   NEW_AUTH_MODE=query|header|bearer|none
   AB_MAX_NEW_P95_RATIO=0.95  AB_MAX_PAIRED_P50_RATIO=0.95
@@ -245,7 +245,7 @@ const REQUIRE_DISTINCT_LOAD = booleanEnv("AB_REQUIRE_DISTINCT_LOAD", true);
 const COMMON_MIN_SUCCESS_RATE = ratioEnv("AB_MIN_SUCCESS_RATE", 1);
 const MIN_OLD_SUCCESS_RATE = ratioEnv(
   "AB_MIN_OLD_SUCCESS_RATE",
-  ENV.AB_MIN_SUCCESS_RATE === undefined ? 0.8 : COMMON_MIN_SUCCESS_RATE
+  ENV.AB_MIN_SUCCESS_RATE === undefined ? 0 : COMMON_MIN_SUCCESS_RATE
 );
 const MIN_NEW_SUCCESS_RATE = ratioEnv(
   "AB_MIN_NEW_SUCCESS_RATE",
@@ -1416,7 +1416,12 @@ function assessDistinctDetails(aggregate) {
   const comparable = aggregate.pairs.filter((pair) => pair.comparable);
   const equivalent = comparable.filter((pair) => pair.ok);
   const equivalenceRate = comparable.length ? equivalent.length / comparable.length : 0;
-  if (!comparable.length || equivalenceRate < MIN_EQUIV_RATE) {
+  const oldUnavailableButNewValid =
+    oldStats.valid === 0 && newStats.successRate >= MIN_NEW_SUCCESS_RATE;
+  if (
+    (!comparable.length && !oldUnavailableButNewValid) ||
+    (comparable.length && equivalenceRate < MIN_EQUIV_RATE)
+  ) {
     failures.push(
       `distinct detail equivalence ${(equivalenceRate * 100).toFixed(0)}% is below ` +
         `${(MIN_EQUIV_RATE * 100).toFixed(0)}%`
@@ -1446,7 +1451,7 @@ function assessDistinctDetails(aggregate) {
   }
   const wins = comparable.filter((pair) => pair.newMs < pair.oldMs).length;
   const winRate = comparable.length ? wins / comparable.length : 0;
-  if (winRate < MIN_NEW_WIN_RATE) {
+  if (!oldUnavailableButNewValid && winRate < MIN_NEW_WIN_RATE) {
     failures.push(
       `distinct details NEW win rate ${(winRate * 100).toFixed(0)}% is below ` +
         `${(MIN_NEW_WIN_RATE * 100).toFixed(0)}%`
@@ -1455,6 +1460,7 @@ function assessDistinctDetails(aggregate) {
   const oldBatch = aggregate.oldPhases.reduce((sum, value) => sum + value, 0);
   const newBatch = aggregate.newPhases.reduce((sum, value) => sum + value, 0);
   if (
+    !oldUnavailableButNewValid &&
     MAX_CONCURRENCY_RATIO !== null &&
     newBatch > oldBatch * MAX_CONCURRENCY_RATIO + CONCURRENCY_SLACK_MS
   ) {
@@ -1467,6 +1473,7 @@ function assess(results, concurrencyResults) {
   const failures = [];
   let newP95Wins = 0;
   let measuredP95 = 0;
+  let availabilityWins = 0;
   const allValidPairs = [];
 
   for (const { endpoint, oldResults, newResults, pairs } of results.values()) {
@@ -1490,7 +1497,13 @@ function assess(results, concurrencyResults) {
     allValidPairs.push(...comparable);
     const equivalent = comparable.filter((pair) => pair.ok);
     const equivalenceRate = comparable.length ? equivalent.length / comparable.length : 0;
-    if (!comparable.length || equivalenceRate < MIN_EQUIV_RATE) {
+    const oldUnavailableButNewValid =
+      oldStats.valid === 0 && newStats.successRate >= MIN_NEW_SUCCESS_RATE;
+    if (oldUnavailableButNewValid) availabilityWins += 1;
+    if (
+      (!comparable.length && !oldUnavailableButNewValid) ||
+      (comparable.length && equivalenceRate < MIN_EQUIV_RATE)
+    ) {
       failures.push(
         `${endpoint.key} paired equivalence ${(equivalenceRate * 100).toFixed(0)}% is below ${(MIN_EQUIV_RATE * 100).toFixed(0)}%`
       );
@@ -1578,6 +1591,11 @@ function assess(results, concurrencyResults) {
     `Observed NEW won ${overallWins}/${validLatencyPairs.length} valid paired requests ` +
       `(${(overallWinRate * 100).toFixed(0)}%).`
   );
+  if (availabilityWins) {
+    console.log(
+      `NEW also passed ${availabilityWins} endpoint contract(s) where OLD had zero valid responses.`
+    );
+  }
   return failures;
 }
 

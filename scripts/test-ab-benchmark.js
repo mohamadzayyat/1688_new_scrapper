@@ -107,6 +107,9 @@ function responseData(key, url, options) {
     return detail;
   }
   if (key === "category_top") {
+    if (options.legacyOld) {
+      return { cat_id: CATEGORY_ID, name: "legacy singleton category" };
+    }
     return { items: [{ cat_id: CATEGORY_ID, name: "mock category" }] };
   }
   if (key === "category_info") {
