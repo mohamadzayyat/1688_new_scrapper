@@ -132,7 +132,7 @@ function categorySerialKey({ categories, keyword, sort, priceStart, priceEnd, la
   ]);
 }
 
-async function withJob(res, label, fn, { tmapi = true, cacheTtl = 0, cacheParts = null, swr = false, serialKey = null } = {}) {
+async function withJob(res, label, fn, { tmapi = true, cacheTtl = 0, cacheParts = null, swr = false, serialKey = null, priority = 0 } = {}) {
   const controller = new AbortController();
   let rejectClientClosed;
   const clientClosed = new Promise((_, reject) => {
@@ -150,6 +150,7 @@ async function withJob(res, label, fn, { tmapi = true, cacheTtl = 0, cacheParts 
   res.once("close", abortOnClose);
   if (res.destroyed || res.closed) abortOnClose();
   let timer;
+  let queueWaitMs = 0;
   try {
     // Cache and singleflight are outside the scrape queue so memory/disk hits
     // never wait behind Chromium work. Every miss and SWR refresh still enters
@@ -178,7 +179,11 @@ async function withJob(res, label, fn, { tmapi = true, cacheTtl = 0, cacheParts 
             enqueueJob(
               label,
               () => runWithJobSignal(workController.signal, fn),
-              { signal: workController.signal }
+              {
+                signal: workController.signal,
+                priority,
+                onStart: (waitMs) => { queueWaitMs = waitMs; },
+              }
             ),
           { signal: workController.signal }
         )
@@ -208,6 +213,10 @@ async function withJob(res, label, fn, { tmapi = true, cacheTtl = 0, cacheParts 
       timer.unref?.();
     });
     const data = await Promise.race([work, deadline, clientClosed]);
+    if (!res.headersSent) {
+      res.setHeader("X-Scrape-Queue-Ms", String(queueWaitMs));
+      res.setHeader("Server-Timing", `scrape_queue;dur=${queueWaitMs}`);
+    }
     if (tmapi) sendTmapi(res, data);
     else sendJson(res, 200, data);
   } catch (err) {
@@ -304,6 +313,7 @@ async function handleItemDetail(req, res) {
       cacheTtl: ITEM_CACHE_TTL,
       cacheParts: ["item_detail", itemId, language, optimizeTitle],
       swr: true,
+      priority: 10,
     }
   );
 }

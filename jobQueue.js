@@ -45,7 +45,8 @@ const QUEUE_TIMEOUT_MS = envInteger("QUEUE_TIMEOUT_MS", 15_000, {
 });
 
 let active = 0;
-const queue = []; // { label, run, resolve, reject, enqueuedAt }
+const queue = []; // { label, run, resolve, reject, enqueuedAt, priority, sequence }
+let sequence = 0;
 let accepted = 0;
 let completed = 0;
 let rejected = 0;
@@ -156,6 +157,7 @@ function pump() {
     }
     active += 1;
     accepted += 1;
+    job.onStart?.(Math.max(0, Date.now() - job.enqueuedAt));
     Promise.resolve()
       .then(() => {
         if (job.signal?.aborted) {
@@ -186,11 +188,12 @@ function pump() {
  * @param {{ signal?: AbortSignal }} [options]
  * @returns {Promise<T>}
  */
-export function enqueueJob(label, run, { signal } = {}) {
+export function enqueueJob(label, run, { signal, priority = 0, onStart } = {}) {
   if (signal?.aborted) return Promise.reject(jobAbortError(signal));
   if (active < MAX_CONCURRENT && queue.length === 0) {
     active += 1;
     accepted += 1;
+    onStart?.(0);
     return Promise.resolve()
       .then(() => {
         if (signal?.aborted) {
@@ -229,6 +232,9 @@ export function enqueueJob(label, run, { signal } = {}) {
       resolve,
       reject,
       enqueuedAt: Date.now(),
+      priority: Number.isFinite(Number(priority)) ? Number(priority) : 0,
+      sequence: sequence++,
+      onStart,
       signal,
       onAbort: null,
     };
@@ -261,7 +267,13 @@ export function enqueueJob(label, run, { signal } = {}) {
       origReject(err);
     };
 
-    queue.push(job);
+    // Interactive product detail requests may jump ahead of bulk search/shop
+    // work, while FIFO ordering remains stable within the same priority.
+    const insertAt = queue.findIndex(
+      (waiting) => waiting.priority < job.priority
+    );
+    if (insertAt < 0) queue.push(job);
+    else queue.splice(insertAt, 0, job);
     if (signal) {
       job.onAbort = () => {
         const idx = queue.indexOf(job);

@@ -47,10 +47,10 @@ const fifoSecond = enqueueJob("fifo-second", async () => {
   fifoOrder.push("second");
   return "second";
 });
-const fifoThird = enqueueJob("fifo-third", async () => {
+const fifoThird = enqueueJob("priority-third", async () => {
   fifoOrder.push("third");
   return "third";
-});
+}, { priority: 10 });
 assert.equal(jobQueueStats().queued, 2);
 assert.throws(
   () => enqueueJob("fifo-overflow", async () => "overflow"),
@@ -62,7 +62,7 @@ assert.deepEqual(await Promise.all([fifoBlocker, fifoSecond, fifoThird]), [
   "second",
   "third",
 ]);
-assert.deepEqual(fifoOrder, ["first", "second", "third"]);
+assert.deepEqual(fifoOrder, ["first", "third", "second"]);
 await new Promise((resolve) => setImmediate(resolve));
 assert.equal(jobQueueStats().active, 0);
 
